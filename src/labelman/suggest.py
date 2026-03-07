@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -121,7 +122,7 @@ def bootstrap(
     """
     paths = image_paths
     if sample is not None and sample < len(paths):
-        paths = paths[:sample]
+        paths = random.sample(paths, sample)
 
     existing_terms: set[str] = set()
     for cat in term_list.categories:
@@ -178,7 +179,7 @@ def expand(
     """
     paths = image_paths
     if sample is not None and sample < len(paths):
-        paths = paths[:sample]
+        paths = random.sample(paths, sample)
 
     # Collect existing terms for filtering
     existing_terms = set()

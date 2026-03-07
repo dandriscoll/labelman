@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -172,6 +173,29 @@ def _integration_error_message(e: subprocess.CalledProcessError) -> list[str]:
     return lines
 
 
+def _parse_sample(value: str | None, total: int) -> int | None:
+    """Parse a sample value like '10' or '25%' into an absolute count."""
+    if value is None:
+        return None
+    value = value.strip()
+    if value.endswith("%"):
+        try:
+            pct = float(value[:-1])
+        except ValueError:
+            raise ValueError(f"Invalid percentage: {value}")
+        if not (0 < pct <= 100):
+            raise ValueError(f"Percentage must be between 0 and 100, got {value}")
+        return max(1, math.ceil(total * pct / 100))
+    else:
+        try:
+            n = int(value)
+        except ValueError:
+            raise ValueError(f"Invalid sample value: {value} (use a number or percentage like 25%)")
+        if n < 1:
+            raise ValueError(f"Sample count must be at least 1, got {n}")
+        return n
+
+
 def cmd_suggest(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     if not config_path.is_file():
@@ -192,7 +216,11 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         return 1
 
     term_list = parse(config_path)
-    sample = args.sample
+    try:
+        sample = _parse_sample(args.sample, len(image_paths))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     try:
         if args.mode == "bootstrap":
