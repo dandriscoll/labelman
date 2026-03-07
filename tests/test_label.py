@@ -4,7 +4,9 @@ import csv
 
 from labelman.label import (
     apply_labels,
+    assemble_final_labels,
     labels_to_caption,
+    load_manual_sidecar,
     write_csv,
     write_report,
     write_sidecar,
@@ -300,3 +302,157 @@ def test_write_report_has_category_stats(tmp_path):
     content = report_path.read_text()
     assert "100.0%" in content  # single assigned to 100% of images
     assert "0.0%" in content    # group assigned to 0%
+
+
+# --- Manual label sidecars ---
+
+def test_load_manual_sidecar_missing(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_text("")
+    labels = load_manual_sidecar(str(img))
+    assert labels == []
+
+
+def test_load_manual_sidecar_valid(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_text("")
+    sidecar = tmp_path / "photo.labels.txt"
+    sidecar.write_text("tail number n123ab\nred stripe livery\n")
+    labels = load_manual_sidecar(str(img))
+    assert labels == ["tail number n123ab", "red stripe livery"]
+
+
+def test_load_manual_sidecar_whitespace_and_blanks(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_text("")
+    sidecar = tmp_path / "photo.labels.txt"
+    sidecar.write_text("  tail number n123ab  \n\n\n  red stripe  \n  \n")
+    labels = load_manual_sidecar(str(img))
+    assert labels == ["tail number n123ab", "red stripe"]
+
+
+def test_load_manual_sidecar_empty_file(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_text("")
+    sidecar = tmp_path / "photo.labels.txt"
+    sidecar.write_text("")
+    labels = load_manual_sidecar(str(img))
+    assert labels == []
+
+
+# --- Final label assembly ---
+
+TAXONOMY_WITH_GLOBALS = """\
+defaults:
+  threshold: 0.3
+global_terms:
+  - aircraft
+  - mooney m20
+categories:
+  - name: count
+    mode: exactly-one
+    terms:
+      - term: single
+      - term: group
+  - name: mood
+    mode: zero-or-more
+    terms:
+      - term: calm
+      - term: energetic
+"""
+
+
+def test_assemble_global_terms_prepended():
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    scores = {"count": {"single": 0.9, "group": 0.1}, "mood": {"calm": 0.5, "energetic": 0.1}}
+    result = assemble_final_labels(tl, "img.jpg", scores)
+    assert result.final_labels[0] == "aircraft"
+    assert result.final_labels[1] == "mooney m20"
+    assert "single" in result.final_labels
+    assert "calm" in result.final_labels
+
+
+def test_assemble_manual_labels_merged():
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    scores = {"count": {"single": 0.9, "group": 0.1}}
+    manual = ["tail number n123ab", "red stripe livery"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "tail number n123ab" in result.final_labels
+    assert "red stripe livery" in result.final_labels
+
+
+def test_assemble_order_global_manual_detected():
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    scores = {"count": {"single": 0.9, "group": 0.1}}
+    manual = ["custom tag"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    # Order: global terms, manual, detected
+    idx_aircraft = result.final_labels.index("aircraft")
+    idx_mooney = result.final_labels.index("mooney m20")
+    idx_custom = result.final_labels.index("custom tag")
+    idx_single = result.final_labels.index("single")
+    assert idx_aircraft < idx_mooney < idx_custom < idx_single
+
+
+def test_assemble_deduplication():
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    scores = {"count": {"single": 0.9, "group": 0.1}, "mood": {"calm": 0.5, "energetic": 0.1}}
+    # manual label duplicates a global term and a detected label
+    manual = ["aircraft", "single", "custom"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    # Each appears exactly once
+    assert result.final_labels.count("aircraft") == 1
+    assert result.final_labels.count("single") == 1
+    assert result.final_labels.count("custom") == 1
+
+
+def test_assemble_manual_outside_taxonomy():
+    """Manual labels not in the taxonomy are still included."""
+    tl = _parse(TAXONOMY)
+    scores = {"count": {"single": 0.9, "group": 0.1}}
+    manual = ["not in taxonomy", "another custom"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "not in taxonomy" in result.final_labels
+    assert "another custom" in result.final_labels
+
+
+def test_assemble_detected_still_obey_thresholds():
+    """Detected labels still respect category rules even with globals/manual."""
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    scores = {"count": {"single": 0.9, "group": 0.1}, "mood": {"calm": 0.1, "energetic": 0.05}}
+    result = assemble_final_labels(tl, "img.jpg", scores)
+    # mood terms below threshold should not appear
+    assert "calm" not in result.final_labels
+    assert "energetic" not in result.final_labels
+    # exactly-one still forces assignment
+    assert "single" in result.final_labels
+
+
+def test_assemble_no_manual_no_global():
+    """Without globals or manuals, final_labels equals detected labels."""
+    tl = _parse(TAXONOMY)
+    scores = {"count": {"single": 0.9, "group": 0.1}, "mood": {"calm": 0.5, "energetic": 0.1}}
+    result = assemble_final_labels(tl, "img.jpg", scores)
+    assert result.final_labels == ["single", "calm"]
+
+
+def test_assemble_deterministic():
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    scores = {"count": {"single": 0.9, "group": 0.1}, "mood": {"calm": 0.5, "energetic": 0.4}}
+    manual = ["custom tag"]
+    r1 = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    r2 = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert r1.final_labels == r2.final_labels
+
+
+def test_assemble_caption_includes_all_sources():
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    scores = {"count": {"single": 0.9, "group": 0.1}}
+    manual = ["custom tag"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    caption = labels_to_caption(result)
+    assert "aircraft" in caption
+    assert "mooney m20" in caption
+    assert "custom tag" in caption
+    assert "single" in caption
+    assert ", " in caption

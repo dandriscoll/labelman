@@ -58,6 +58,7 @@ class TermList:
     defaults: Defaults
     categories: list[Category]
     integrations: Integrations
+    global_terms: list[str]
 
     def effective_threshold(self, category: Category, term: Term) -> float:
         if term.threshold is not None:
@@ -161,6 +162,21 @@ def parse(source: str | Path) -> TermList:
                 integrations_obj.blip = _parse_integration(integ_raw["blip"], "blip", errors)
             if "clip" in integ_raw:
                 integrations_obj.clip = _parse_integration(integ_raw["clip"], "clip", errors)
+
+    # --- global_terms (optional) ---
+    global_terms_list: list[str] = []
+    if "global_terms" in data:
+        gt_raw = data["global_terms"]
+        if not isinstance(gt_raw, list):
+            errors.append("'global_terms' must be a list")
+        else:
+            for i, item in enumerate(gt_raw):
+                if not isinstance(item, str):
+                    errors.append(f"global_terms[{i}]: must be a string, got {type(item).__name__}")
+                elif not item.strip():
+                    errors.append(f"global_terms[{i}]: must not be empty")
+                else:
+                    global_terms_list.append(item.strip())
 
     # --- categories ---
     if "categories" not in data:
@@ -283,4 +299,9 @@ def parse(source: str | Path) -> TermList:
         raise ParseError(errors)
 
     assert defaults_obj is not None
-    return TermList(defaults=defaults_obj, categories=categories_list, integrations=integrations_obj)
+    return TermList(
+        defaults=defaults_obj,
+        categories=categories_list,
+        integrations=integrations_obj,
+        global_terms=global_terms_list,
+    )

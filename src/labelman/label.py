@@ -18,6 +18,8 @@ class ImageLabels:
     """Mapping of category name to list of assigned term strings."""
     all_scores: dict[str, dict[str, float]] = field(default_factory=dict)
     """All raw scores for every term, including suppressed ones."""
+    final_labels: list[str] = field(default_factory=list)
+    """Deduplicated merged labels: global + manual + detected, in order."""
 
 
 # Scores type: {category_name: {term_name: float}}
@@ -60,8 +62,78 @@ def apply_labels(term_list: TermList, image: str, scores: Scores) -> ImageLabels
     return ImageLabels(image=image, labels=labels, all_scores=scores)
 
 
+def load_manual_sidecar(image_path: str) -> list[str]:
+    """Load manual labels from a .labels.txt sidecar file if it exists.
+
+    Sidecar naming: for image_001.jpg, the sidecar is image_001.labels.txt.
+    Format: one label per line, whitespace-trimmed, blank lines ignored.
+    Returns an empty list if no sidecar exists.
+    """
+    p = Path(image_path)
+    sidecar = p.with_suffix(".labels.txt")
+    if not sidecar.is_file():
+        return []
+    lines = sidecar.read_text().splitlines()
+    labels = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped:
+            labels.append(stripped)
+    return labels
+
+
+def assemble_final_labels(
+    term_list: TermList,
+    image: str,
+    scores: Scores,
+    manual_labels: list[str] | None = None,
+) -> ImageLabels:
+    """Assemble final labels for an image from all sources.
+
+    Merge order:
+      1. global_terms from labelman.yaml (applied to every image)
+      2. manual sidecar labels (per-image overrides)
+      3. detected labels (from category/threshold rules)
+
+    Global and manual labels bypass detection, thresholds, and category
+    semantics. They are literal labels. The final list is deduplicated
+    while preserving first-occurrence order.
+    """
+    detected = apply_labels(term_list, image, scores)
+
+    # Collect detected labels in category order
+    detected_flat: list[str] = []
+    for cat_terms in detected.labels.values():
+        detected_flat.extend(cat_terms)
+
+    if manual_labels is None:
+        manual_labels = []
+
+    # Merge in order: global, manual, detected — deduplicate
+    merged: list[str] = []
+    seen: set[str] = set()
+    for label in [*term_list.global_terms, *manual_labels, *detected_flat]:
+        if label not in seen:
+            merged.append(label)
+            seen.add(label)
+
+    result = ImageLabels(
+        image=image,
+        labels=detected.labels,
+        all_scores=scores,
+        final_labels=merged,
+    )
+    return result
+
+
 def labels_to_caption(result: ImageLabels) -> str:
-    """Convert image labels to a stable-diffusion-style comma-separated caption."""
+    """Convert image labels to a stable-diffusion-style comma-separated caption.
+
+    Uses final_labels if available (includes global/manual/detected).
+    Falls back to category labels only.
+    """
+    if result.final_labels:
+        return ", ".join(result.final_labels)
     terms = []
     for cat_terms in result.labels.values():
         terms.extend(cat_terms)

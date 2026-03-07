@@ -68,6 +68,10 @@
 defaults:
   threshold: 0.3            # Global default threshold. Required.
 
+global_terms:                 # Optional. Literal labels applied to every image.
+  - aircraft
+  - mooney m20
+
 integrations:
   blip:
     endpoint: http://localhost:8080/caption   # Use built-in script with this URL
@@ -108,6 +112,7 @@ categories:
 |---|---|---|---|
 | `defaults` | object | Yes | Global default settings. |
 | `defaults.threshold` | float (0.0–1.0) | Yes | Global confidence threshold. |
+| `global_terms` | list of strings | No | Literal labels applied to every image. Bypass detection and thresholds. |
 | `integrations` | object | No | Integration configuration for BLIP/CLIP. |
 | `integrations.blip` | object | No | BLIP integration config: `endpoint` (URL) or `script` (path). |
 | `integrations.clip` | object | No | CLIP integration config: `endpoint` (URL) or `script` (path). |
@@ -396,11 +401,63 @@ A self-contained HTML report showing:
 - **Per-category statistics**: assignment counts and percentages for each term
 - **Per-image detail table**: all scores with assigned terms highlighted
 
+### Global Baseline Terms
+
+`labelman.yaml` supports an optional `global_terms` list:
+
+```yaml
+global_terms:
+  - aircraft
+  - mooney m20
+```
+
+These labels are applied to every image. They bypass detection, thresholds, and category semantics. They do not need to appear in any category. They appear first in the final label output.
+
+### Manual Label Sidecars
+
+Per-image manual labels can be provided via sidecar files:
+
+```
+image_001.jpg              # the image
+image_001.labels.txt       # the manual label sidecar
+```
+
+Sidecar format: plain text, one label per line, whitespace-trimmed, blank lines ignored.
+
+```
+tail number n123ab
+red stripe livery
+```
+
+Manual labels bypass detection and thresholds. They are authoritative literal labels that do not need to appear in the taxonomy. If no sidecar exists, no manual labels are applied (this is not an error).
+
+### Final Label Assembly
+
+Labels are assembled in this order:
+
+1. **Global baseline terms** (from `global_terms` in `labelman.yaml`)
+2. **Manual sidecar labels** (from `{image_stem}.labels.txt`)
+3. **Detected labels** (from category rules and thresholds)
+
+The final list is deduplicated (first occurrence wins) to produce a stable, deterministic caption. For example:
+
+```
+aircraft, mooney m20, tail number n123ab, red stripe livery, single, outdoor, calm
+```
+
+Edge cases:
+- A manual label that matches a detected label: appears once (at the manual position).
+- A manual label not in the taxonomy: included as-is.
+- A missing sidecar: no manual labels, not an error.
+- An empty sidecar: treated as no manual labels.
+- Global term that matches a detected or manual label: appears once (at the global position).
+
 ### Constraints
 
 - Output must respect category mode. An `exactly-one` category always has a value. A `zero-or-one` category has zero or one. A `zero-or-more` category has a list.
-- Only terms from the current `labelman.yaml` appear in output.
-- The output must be deterministic given the same inputs (taxonomy, images, model scores).
+- Detected labels come only from the current `labelman.yaml` taxonomy.
+- Global and manual labels are outside category enforcement and may contain any string.
+- The output must be deterministic given the same inputs (taxonomy, images, model scores, sidecars, global terms).
 - The CSV includes all scores regardless of assignment, enabling post-hoc threshold analysis.
 
 ---
@@ -427,6 +484,10 @@ A self-contained HTML report showing:
 ```yaml
 defaults:
   threshold: 0.3
+
+global_terms:
+  - aircraft
+  - mooney m20
 
 integrations:
   blip:
@@ -489,11 +550,17 @@ Given an image scored by CLIP against the above taxonomy:
 | `mood/tense` | 0.27 |
 | `mood/joyful` | 0.31 |
 
-**Result:**
+**Detected labels:**
 
 - `subject_count`: **single** (highest score, `exactly-one` mode, above threshold)
 - `setting`: **none** (no term meets category threshold of 0.45; `zero-or-one` allows empty)
 - `mood`: **calm**, **tense**, **joyful** (`zero-or-more`; calm=0.55>=0.3, tense=0.27>=0.25, joyful=0.31>=0.3; energetic=0.12<0.3 excluded)
+
+**Final assembled caption** (assuming a manual sidecar with `tail number n123ab`):
+
+```
+aircraft, mooney m20, tail number n123ab, single, calm, tense, joyful
+```
 
 ---
 

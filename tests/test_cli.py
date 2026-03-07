@@ -100,6 +100,45 @@ def test_cli_init_includes_integrations(tmp_path):
     assert "endpoint:" in content
 
 
+def test_cli_init_demonstrates_all_modes(tmp_path):
+    """The starter file should show all three category modes."""
+    from labelman.schema import CategoryMode, parse
+
+    main(["init", "--dir", str(tmp_path)])
+    tl = parse(tmp_path / "labelman.yaml")
+    modes = {c.mode for c in tl.categories}
+    assert CategoryMode.EXACTLY_ONE in modes
+    assert CategoryMode.ZERO_OR_ONE in modes
+    assert CategoryMode.ZERO_OR_MORE in modes
+
+
+def test_cli_init_demonstrates_threshold_overrides(tmp_path):
+    """The starter file should show per-category and per-term threshold overrides."""
+    from labelman.schema import parse
+
+    main(["init", "--dir", str(tmp_path)])
+    tl = parse(tmp_path / "labelman.yaml")
+    # At least one category with a threshold override
+    cat_overrides = [c for c in tl.categories if c.threshold is not None]
+    assert len(cat_overrides) >= 1
+    # At least one term with a threshold override
+    term_overrides = [
+        t for c in tl.categories for t in c.terms if t.threshold is not None
+    ]
+    assert len(term_overrides) >= 1
+
+
+def test_cli_init_has_comments(tmp_path):
+    """The starter file should include explanatory comments."""
+    main(["init", "--dir", str(tmp_path)])
+    content = (tmp_path / "labelman.yaml").read_text()
+    assert "exactly-one" in content
+    assert "zero-or-one" in content
+    assert "zero-or-more" in content
+    assert "# " in content  # has comments
+    assert "script:" in content  # shows custom script option
+
+
 def test_cli_descriptor_blip(capsys):
     result = main(["descriptor", "blip"])
     assert result == 0

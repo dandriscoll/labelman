@@ -14,6 +14,7 @@ class CheckResult:
     warnings: list[str]
     num_categories: int
     num_terms: int
+    num_global_terms: int = 0
 
 
 def check(source: str) -> CheckResult:
@@ -80,4 +81,5 @@ def check(source: str) -> CheckResult:
         warnings=warnings,
         num_categories=len(term_list.categories),
         num_terms=total_terms,
+        num_global_terms=len(term_list.global_terms),
     )

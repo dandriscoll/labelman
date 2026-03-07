@@ -299,3 +299,92 @@ categories:
 """)
     errors = exc_info.value.errors
     assert len(errors) >= 2
+
+
+# --- Global terms ---
+
+def test_parse_global_terms():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+global_terms:
+  - aircraft
+  - mooney m20
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+    assert tl.global_terms == ["aircraft", "mooney m20"]
+
+
+def test_parse_global_terms_optional():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+    assert tl.global_terms == []
+
+
+def test_parse_global_terms_empty_list():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+global_terms: []
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+    assert tl.global_terms == []
+
+
+def test_parse_global_terms_not_a_list():
+    with pytest.raises(ParseError, match="must be a list"):
+        parse("""\
+defaults:
+  threshold: 0.3
+global_terms: "aircraft"
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+
+
+def test_parse_global_terms_non_string_item():
+    with pytest.raises(ParseError, match="must be a string"):
+        parse("""\
+defaults:
+  threshold: 0.3
+global_terms:
+  - 123
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+
+
+def test_parse_global_terms_whitespace_trimmed():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+global_terms:
+  - "  aircraft  "
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+    assert tl.global_terms == ["aircraft"]
