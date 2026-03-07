@@ -10,7 +10,8 @@ import sys
 from pathlib import Path
 
 from .check import check
-from .integrations import get_descriptor
+from .integrations import get_descriptor, run_clip
+from .label import assemble_final_labels, load_manual_sidecar, write_csv, write_report, write_sidecar
 from .schema import parse
 from .suggest import bootstrap, expand, format_suggest_result
 
@@ -207,10 +208,7 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         print(f"Error: {images_path} is not a directory", file=sys.stderr)
         return 1
 
-    image_paths = sorted(
-        str(p) for p in images_path.iterdir()
-        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
-    )
+    image_paths = _find_images(images_path)
     if not image_paths:
         print(f"Error: no images found in {images_path}", file=sys.stderr)
         return 1
@@ -242,6 +240,119 @@ def cmd_suggest(args: argparse.Namespace) -> int:
     else:
         print(output, end="")
 
+    return 0
+
+
+def _find_images(directory: Path) -> list[str]:
+    """Find image files in a directory, sorted by name."""
+    extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+    return sorted(
+        str(p) for p in directory.iterdir()
+        if p.suffix.lower() in extensions
+    )
+
+
+def _reshape_clip_scores(term_list, clip_results: list[dict]) -> dict[str, dict[str, dict[str, float]]]:
+    """Reshape flat CLIP scores into per-category scores keyed by image path.
+
+    CLIP returns: [{"image": path, "scores": {"term": float, ...}}]
+    apply_labels expects: {"category": {"term": float, ...}}
+    """
+    # Build term->category mapping
+    term_to_cat: dict[str, str] = {}
+    for cat in term_list.categories:
+        for t in cat.terms:
+            term_to_cat[t.term] = cat.name
+
+    result = {}
+    for entry in clip_results:
+        image = entry["image"]
+        flat_scores = entry.get("scores", {})
+        cat_scores: dict[str, dict[str, float]] = {}
+        for term, score in flat_scores.items():
+            cat_name = term_to_cat.get(term)
+            if cat_name is not None:
+                if cat_name not in cat_scores:
+                    cat_scores[cat_name] = {}
+                cat_scores[cat_name][term] = score
+        result[image] = cat_scores
+    return result
+
+
+def cmd_label(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    if not config_path.is_file():
+        print(f"Error: {config_path} not found", file=sys.stderr)
+        return 1
+
+    images_path = Path(args.images)
+    if not images_path.is_dir():
+        print(f"Error: {images_path} is not a directory", file=sys.stderr)
+        return 1
+
+    image_paths = _find_images(images_path)
+    if not image_paths:
+        print(f"Error: no images found in {images_path}", file=sys.stderr)
+        return 1
+
+    quiet = args.quiet
+    term_list = parse(config_path)
+
+    # Check that there are terms to label with
+    total_terms = sum(len(c.terms) for c in term_list.categories)
+    if total_terms == 0:
+        print("Error: no terms defined in any category — nothing to label", file=sys.stderr)
+        return 1
+
+    num_images = len(image_paths)
+    num_cats = len(term_list.categories)
+    if not quiet:
+        print(f"Scoring {num_images} images against {total_terms} terms in {num_cats} categories...")
+
+    # Run CLIP
+    try:
+        clip_results = run_clip(term_list, image_paths)
+    except subprocess.CalledProcessError as e:
+        for line in _integration_error_message(e):
+            print(line, file=sys.stderr)
+        return 1
+
+    scores_by_image = _reshape_clip_scores(term_list, clip_results)
+
+    # Determine output directory
+    output_dir = Path(args.output) if args.output else images_path
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Label each image
+    if not quiet:
+        print("Labeling images...")
+    results = []
+    for i, image_path in enumerate(image_paths, 1):
+        scores = scores_by_image.get(image_path, {})
+        manual = load_manual_sidecar(image_path)
+        result = assemble_final_labels(term_list, image_path, scores, manual_labels=manual)
+        results.append(result)
+
+        # Write per-image sidecar
+        sidecar = write_sidecar(result, output_dir=output_dir)
+        if not quiet:
+            name = Path(image_path).name
+            n_labels = len(result.final_labels)
+            print(f"  [{i}/{num_images}] {name} -> {sidecar.name} ({n_labels} labels)")
+
+    # Write CSV
+    csv_path = output_dir / "labels.csv"
+    write_csv(term_list, results, csv_path)
+
+    # Write HTML report
+    report_path = output_dir / "report.html"
+    write_report(term_list, results, report_path)
+
+    if not quiet:
+        print(f"Done: {len(results)} images labeled")
+        print(f"  Sidecars: {output_dir}/*.txt")
+        print(f"  CSV:      {csv_path}")
+        print(f"  Report:   {report_path}")
     return 0
 
 
@@ -279,6 +390,14 @@ def build_parser() -> argparse.ArgumentParser:
     suggest_p.add_argument("--output", default=None, help="Write suggestions to file (default: stdout)")
     suggest_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
 
+    # label
+    label_p = sub.add_parser("label", help="Apply taxonomy labels to images")
+    label_p.add_argument("--images", default=".", help="Directory containing images")
+    label_p.add_argument("--output", default=None,
+                         help="Output directory for sidecars, CSV, and report (default: same as --images)")
+    label_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
+    label_p.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
+
     # descriptor
     desc_p = sub.add_parser("descriptor", help="Print a Boutiques descriptor for a built-in integration")
     desc_p.add_argument("tool", choices=["blip", "clip"], help="Integration name")
@@ -298,6 +417,7 @@ def main(argv: list[str] | None = None) -> int:
         "init": cmd_init,
         "check": cmd_check,
         "suggest": cmd_suggest,
+        "label": cmd_label,
         "descriptor": cmd_descriptor,
     }
     return handlers[args.command](args)
