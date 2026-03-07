@@ -1,0 +1,33 @@
+defaults:
+  threshold: 0.3
+
+integrations:
+  blip:
+    endpoint: http://localhost:8080/caption
+  clip:
+    endpoint: http://localhost:8081/classify
+
+categories:
+  - name: subject_count
+    mode: exactly-one
+    terms:
+      - term: single
+      - term: couple
+      - term: group
+
+  - name: setting
+    mode: zero-or-one
+    threshold: 0.45
+    terms:
+      - term: indoor
+      - term: outdoor
+      - term: studio
+
+  - name: mood
+    mode: zero-or-more
+    terms:
+      - term: calm
+      - term: energetic
+      - term: tense
+        threshold: 0.25
+      - term: joyful

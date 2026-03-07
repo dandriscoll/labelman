@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "labelman"
+version = "0.1.0"
+description = "Bulk image labeling tool for fine-tuning datasets"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+labelman = "labelman.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+labelman = ["scripts/*.sh", "descriptors/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

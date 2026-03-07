@@ -1,0 +1,44 @@
+{
+  "name": "labelman-blip",
+  "tool-version": "0.1.0",
+  "description": "Caption images using a BLIP HTTP endpoint. Returns per-image captions as JSON lines.",
+  "command-line": "blip.sh --endpoint [ENDPOINT] [PROMPT_FLAG] [IMAGES]",
+  "schema-version": "0.5",
+  "inputs": [
+    {
+      "id": "endpoint",
+      "name": "BLIP endpoint URL",
+      "type": "String",
+      "command-line-key": "[ENDPOINT]",
+      "description": "HTTP endpoint that accepts image uploads and returns captions.",
+      "optional": false
+    },
+    {
+      "id": "prompt",
+      "name": "Prompt or question",
+      "type": "String",
+      "command-line-key": "[PROMPT_FLAG]",
+      "command-line-flag": "--prompt",
+      "description": "Optional prompt or question for VQA-style captioning.",
+      "optional": true
+    },
+    {
+      "id": "images",
+      "name": "Image file paths",
+      "type": "File",
+      "command-line-key": "[IMAGES]",
+      "command-line-flag": "--images",
+      "description": "One or more image file paths to caption.",
+      "optional": false,
+      "list": true
+    }
+  ],
+  "output-files": [
+    {
+      "id": "captions",
+      "name": "Captions output",
+      "description": "JSON lines output. Each line: {\"image\": \"<path>\", \"caption\": \"<text>\"}",
+      "path-template": "stdout"
+    }
+  ]
+}

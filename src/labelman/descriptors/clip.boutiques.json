@@ -1,0 +1,44 @@
+{
+  "name": "labelman-clip",
+  "tool-version": "0.1.0",
+  "description": "Classify images against candidate terms using a CLIP HTTP endpoint. Returns per-image, per-term confidence scores.",
+  "command-line": "clip.sh --endpoint [ENDPOINT] --terms [TERMS] [IMAGES]",
+  "schema-version": "0.5",
+  "inputs": [
+    {
+      "id": "endpoint",
+      "name": "CLIP endpoint URL",
+      "type": "String",
+      "command-line-key": "[ENDPOINT]",
+      "description": "HTTP endpoint that accepts images and candidate terms, returns similarity scores.",
+      "optional": false
+    },
+    {
+      "id": "terms",
+      "name": "Candidate terms",
+      "type": "String",
+      "command-line-key": "[TERMS]",
+      "command-line-flag": "--terms",
+      "description": "Comma-separated list of candidate term strings to score against each image.",
+      "optional": false
+    },
+    {
+      "id": "images",
+      "name": "Image file paths",
+      "type": "File",
+      "command-line-key": "[IMAGES]",
+      "command-line-flag": "--images",
+      "description": "One or more image file paths to classify.",
+      "optional": false,
+      "list": true
+    }
+  ],
+  "output-files": [
+    {
+      "id": "scores",
+      "name": "Classification scores",
+      "description": "JSON lines output. Each line: {\"image\": \"<path>\", \"scores\": {\"<term>\": <float>, ...}}",
+      "path-template": "stdout"
+    }
+  ]
+}
