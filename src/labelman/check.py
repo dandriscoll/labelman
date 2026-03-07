@@ -42,7 +42,12 @@ def check(source: str) -> CheckResult:
         num_terms = len(cat.terms)
         total_terms += num_terms
 
-        if cat.mode == CategoryMode.EXACTLY_ONE and num_terms < 2:
+        if num_terms == 0 and not cat.question:
+            warnings.append(
+                f"Category '{cat.name}': no terms and no question — "
+                f"this category won't do anything"
+            )
+        elif cat.mode == CategoryMode.EXACTLY_ONE and 0 < num_terms < 2:
             warnings.append(
                 f"Category '{cat.name}': exactly-one mode with only {num_terms} term(s) "
                 f"is likely a mistake"

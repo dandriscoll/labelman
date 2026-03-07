@@ -75,6 +75,11 @@ def run_clip(
     for cat in term_list.categories:
         for t in cat.terms:
             all_terms.append(t.term)
+
+    if not all_terms:
+        # No terms to score — return empty scores for each image
+        return [{"image": p, "scores": {}} for p in image_paths]
+
     terms_str = ",".join(all_terms)
 
     cmd = [script]
@@ -94,6 +99,7 @@ def run_blip(
     term_list: TermList,
     image_paths: list[str],
     prompt: Optional[str] = None,
+    max_tokens: Optional[int] = None,
 ) -> list[dict]:
     """Invoke the BLIP integration and return per-image captions.
 
@@ -108,6 +114,8 @@ def run_blip(
         cmd += ["--endpoint", endpoint]
     if prompt:
         cmd += ["--prompt", prompt]
+    if max_tokens is not None:
+        cmd += ["--max-tokens", str(max_tokens)]
     cmd += ["--images"] + image_paths
 
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)

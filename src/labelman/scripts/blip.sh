@@ -2,7 +2,7 @@
 # Built-in BLIP integration script for labelman.
 # Sends images to a BLIP HTTP endpoint and returns captions as JSON lines.
 #
-# Usage: blip.sh --endpoint URL [--prompt TEXT] --images FILE [FILE ...]
+# Usage: blip.sh --endpoint URL [--prompt TEXT] [--max-tokens N] --images FILE [FILE ...]
 #
 # Output (stdout): one JSON line per image:
 #   {"image": "path/to/img.jpg", "caption": "a photo of a cat"}
@@ -16,6 +16,7 @@ set -euo pipefail
 
 ENDPOINT=""
 PROMPT=""
+MAX_TOKENS=""
 IMAGES=()
 parsing_images=false
 
@@ -27,6 +28,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --prompt)
             PROMPT="$2"
+            shift 2
+            ;;
+        --max-tokens)
+            MAX_TOKENS="$2"
             shift 2
             ;;
         --images)
@@ -67,10 +72,21 @@ for img in "${IMAGES[@]}"; do
 
     curl_args=(-s -X POST "$ENDPOINT" -F "file=@$img")
     if [[ -n "$PROMPT" ]]; then
-        curl_args+=(-F "prompt=$PROMPT")
+        # BLIP-2 VQA works best with "Question: ... Answer:" format
+        formatted_prompt="Question: $PROMPT Answer:"
+        curl_args+=(-F "prompt=$formatted_prompt")
+    fi
+    if [[ -n "$MAX_TOKENS" ]]; then
+        curl_args+=(-F "max_tokens=$MAX_TOKENS")
     fi
 
     response=$(curl "${curl_args[@]}")
-    caption=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['caption'])")
-    python3 -c "import json; print(json.dumps({'image': '$img', 'caption': '''$caption'''}))"
+    echo "$response" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+text = data.get('caption') or data.get('answer', '')
+image = sys.argv[1]
+key = 'answer' if 'answer' in data else 'caption'
+print(json.dumps({'image': image, key: text}))
+" "$img"
 done

@@ -388,3 +388,88 @@ categories:
       - term: x
 """)
     assert tl.global_terms == ["aircraft"]
+
+
+def test_parse_category_question():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: lighting
+    mode: zero-or-one
+    question: "What type of lighting is in this image?"
+    terms:
+      - term: natural
+      - term: studio
+""")
+    assert tl.categories[0].question == "What type of lighting is in this image?"
+
+
+def test_parse_category_question_optional():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: subject
+    mode: exactly-one
+    terms:
+      - term: person
+      - term: animal
+""")
+    assert tl.categories[0].question is None
+
+
+def test_parse_category_question_empty():
+    with pytest.raises(ParseError, match="must not be empty"):
+        parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: subject
+    mode: exactly-one
+    question: ""
+    terms:
+      - term: person
+      - term: animal
+""")
+
+
+def test_parse_category_question_no_terms():
+    """A category with a question but no terms should parse successfully."""
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: lighting
+    mode: zero-or-one
+    question: "What type of lighting is in this image?"
+""")
+    assert tl.categories[0].name == "lighting"
+    assert tl.categories[0].question == "What type of lighting is in this image?"
+    assert tl.categories[0].terms == []
+
+
+def test_parse_category_question_empty_terms():
+    """A category with a question and empty terms list should parse successfully."""
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: lighting
+    mode: zero-or-one
+    question: "What type of lighting is in this image?"
+    terms: []
+""")
+    assert tl.categories[0].terms == []
+
+
+def test_parse_category_no_terms_no_question():
+    """A category without terms AND without a question should fail."""
+    with pytest.raises(ParseError, match="missing required key 'terms'"):
+        parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: subject
+    mode: exactly-one
+""")

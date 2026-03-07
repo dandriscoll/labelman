@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
 from .check import check
 from .integrations import get_descriptor
+from .schema import parse
+from .suggest import bootstrap, expand, format_suggest_result
 
 
 DEFAULT_CONFIG = "labelman.yaml"
@@ -102,9 +105,13 @@ categories:
 
   # zero-or-one: at most one label. If nothing scores above threshold, none is assigned.
   # threshold here overrides the global default for this category.
+  # question: optional VQA prompt for BLIP during 'suggest'
+  # question_answer_max_tokens: limit answer length (default: 100)
   - name: setting
     mode: zero-or-one
     threshold: 0.4
+    question: "Is this photo taken indoors, outdoors, or in a studio?"
+    question_answer_max_tokens: 10
     terms:
       - term: indoor
       - term: outdoor
@@ -122,6 +129,91 @@ categories:
 """
     config_path.write_text(starter)
     print(f"Created {config_path}")
+    return 0
+
+
+def _integration_error_message(e: subprocess.CalledProcessError) -> list[str]:
+    """Turn a CalledProcessError from an integration script into useful messages."""
+    cmd_name = Path(e.cmd[0]).name if e.cmd else "unknown"
+    tool = cmd_name.replace(".sh", "")  # "blip.sh" -> "blip"
+    endpoint = None
+    for i, arg in enumerate(e.cmd or []):
+        if arg == "--endpoint" and i + 1 < len(e.cmd):
+            endpoint = e.cmd[i + 1]
+            break
+
+    # These exit codes come from curl, which the integration scripts wrap
+    curl_errors = {
+        6:  "Could not resolve hostname",
+        7:  "Connection refused",
+        22: "Server returned an HTTP error",
+        28: "Request timed out",
+        35: "SSL/TLS connection error",
+        52: "Server returned an empty response",
+        55: "Failed to send request data",
+        56: "Failed to receive response data",
+    }
+
+    lines = []
+    reason = curl_errors.get(e.returncode)
+    if reason and endpoint:
+        lines.append(f"Error: {reason} — {endpoint}")
+        lines.append(f"  Check that the {tool} service is running and the endpoint in labelman.yaml is correct.")
+    elif reason:
+        lines.append(f"Error: {reason} (from {cmd_name})")
+        lines.append(f"  Check the integrations.{tool} section in labelman.yaml.")
+    else:
+        lines.append(f"Error: {cmd_name} exited with code {e.returncode}")
+
+    if e.stderr:
+        for line in e.stderr.strip().splitlines():
+            lines.append(f"  {line}")
+
+    return lines
+
+
+def cmd_suggest(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    if not config_path.is_file():
+        print(f"Error: {config_path} not found", file=sys.stderr)
+        return 1
+
+    images_path = Path(args.images)
+    if not images_path.is_dir():
+        print(f"Error: {images_path} is not a directory", file=sys.stderr)
+        return 1
+
+    image_paths = sorted(
+        str(p) for p in images_path.iterdir()
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+    )
+    if not image_paths:
+        print(f"Error: no images found in {images_path}", file=sys.stderr)
+        return 1
+
+    term_list = parse(config_path)
+    sample = args.sample
+
+    try:
+        if args.mode == "bootstrap":
+            result = bootstrap(term_list, image_paths, sample=sample)
+        else:
+            result = expand(term_list, image_paths, sample=sample)
+    except subprocess.CalledProcessError as e:
+        for line in _integration_error_message(e):
+            print(line, file=sys.stderr)
+        return 1
+
+    output = format_suggest_result(result)
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(output)
+        print(f"Wrote suggestions to {out_path}")
+    else:
+        print(output, end="")
+
     return 0
 
 
@@ -149,6 +241,16 @@ def build_parser() -> argparse.ArgumentParser:
     check_p = sub.add_parser("check", help="Validate labelman.yaml")
     check_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
 
+    # suggest
+    suggest_p = sub.add_parser("suggest", help="Propose taxonomy terms from image analysis")
+    suggest_p.add_argument("--mode", choices=["bootstrap", "expand"], default="bootstrap",
+                           help="bootstrap: propose new categories/terms; expand: add terms to existing categories")
+    suggest_p.add_argument("--sample", default=None,
+                           help="Number (e.g. 10) or percentage (e.g. 25%%) of images to sample")
+    suggest_p.add_argument("--images", default=".", help="Directory containing images")
+    suggest_p.add_argument("--output", default=None, help="Write suggestions to file (default: stdout)")
+    suggest_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
+
     # descriptor
     desc_p = sub.add_parser("descriptor", help="Print a Boutiques descriptor for a built-in integration")
     desc_p.add_argument("tool", choices=["blip", "clip"], help="Integration name")
@@ -167,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {
         "init": cmd_init,
         "check": cmd_check,
+        "suggest": cmd_suggest,
         "descriptor": cmd_descriptor,
     }
     return handlers[args.command](args)

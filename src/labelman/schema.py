@@ -28,6 +28,8 @@ class Category:
     mode: CategoryMode
     terms: list[Term]
     threshold: Optional[float] = None
+    question: Optional[str] = None
+    question_answer_max_tokens: Optional[int] = None
 
 
 @dataclass
@@ -234,9 +236,33 @@ def parse(source: str | Path) -> TermList:
                     if not t_errors:
                         cat_threshold = float(cat_raw["threshold"])
 
-                # terms
+                # question (optional)
+                cat_question = None
+                if "question" in cat_raw:
+                    q_val = cat_raw["question"]
+                    if not isinstance(q_val, str):
+                        errors.append(f"{cat_ctx}.question: must be a string")
+                    elif not q_val.strip():
+                        errors.append(f"{cat_ctx}.question: must not be empty")
+                    else:
+                        cat_question = q_val.strip()
+
+                # question_answer_max_tokens (optional, only meaningful with question)
+                cat_max_tokens = None
+                if "question_answer_max_tokens" in cat_raw:
+                    mt_val = cat_raw["question_answer_max_tokens"]
+                    if not isinstance(mt_val, int) or isinstance(mt_val, bool):
+                        errors.append(f"{cat_ctx}.question_answer_max_tokens: must be a positive integer")
+                    elif mt_val < 1:
+                        errors.append(f"{cat_ctx}.question_answer_max_tokens: must be a positive integer, got {mt_val}")
+                    else:
+                        cat_max_tokens = mt_val
+
+                # terms (optional when question is set)
+                has_question = cat_question is not None
                 if "terms" not in cat_raw:
-                    errors.append(f"{cat_ctx}: missing required key 'terms'")
+                    if not has_question:
+                        errors.append(f"{cat_ctx}: missing required key 'terms' (or provide a 'question')")
                     terms_list = []
                 else:
                     terms_raw = cat_raw["terms"]
@@ -244,7 +270,8 @@ def parse(source: str | Path) -> TermList:
                         errors.append(f"{cat_ctx}.terms: must be a list")
                         terms_list = []
                     elif len(terms_raw) == 0:
-                        errors.append(f"{cat_ctx}.terms: must not be empty")
+                        if not has_question:
+                            errors.append(f"{cat_ctx}.terms: must not be empty (or provide a 'question')")
                         terms_list = []
                     else:
                         terms_list = []
@@ -292,6 +319,8 @@ def parse(source: str | Path) -> TermList:
                             mode=cat_mode,
                             terms=terms_list,
                             threshold=cat_threshold,
+                            question=cat_question,
+                            question_answer_max_tokens=cat_max_tokens,
                         )
                     )
 
