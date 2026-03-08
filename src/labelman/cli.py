@@ -307,28 +307,26 @@ def cmd_label(args: argparse.Namespace) -> int:
     num_images = len(image_paths)
     num_cats = len(term_list.categories)
     if not quiet:
-        print(f"Scoring {num_images} images against {total_terms} terms in {num_cats} categories...")
-
-    # Run CLIP
-    try:
-        clip_results = run_clip(term_list, image_paths)
-    except subprocess.CalledProcessError as e:
-        for line in _integration_error_message(e):
-            print(line, file=sys.stderr)
-        return 1
-
-    scores_by_image = _reshape_clip_scores(term_list, clip_results)
+        print(f"Labeling {num_images} images against {total_terms} terms in {num_cats} categories...", flush=True)
 
     # Determine output directory
     output_dir = Path(args.output) if args.output else images_path
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Label each image
-    if not quiet:
-        print("Labeling images...")
+    # Score and label each image
     results = []
     for i, image_path in enumerate(image_paths, 1):
-        scores = scores_by_image.get(image_path, {})
+        name = Path(image_path).name
+
+        # Score with CLIP
+        try:
+            clip_results = run_clip(term_list, [image_path])
+        except subprocess.CalledProcessError as e:
+            for line in _integration_error_message(e):
+                print(line, file=sys.stderr)
+            return 1
+
+        scores = _reshape_clip_scores(term_list, clip_results).get(image_path, {})
         manual = load_manual_sidecar(image_path)
         result = assemble_final_labels(term_list, image_path, scores, manual_labels=manual)
         results.append(result)
@@ -336,9 +334,8 @@ def cmd_label(args: argparse.Namespace) -> int:
         # Write per-image sidecar
         sidecar = write_sidecar(result, output_dir=output_dir)
         if not quiet:
-            name = Path(image_path).name
             n_labels = len(result.final_labels)
-            print(f"  [{i}/{num_images}] {name} -> {sidecar.name} ({n_labels} labels)")
+            print(f"  [{i}/{num_images}] {name} -> {sidecar.name} ({n_labels} labels)", flush=True)
 
     # Write CSV
     csv_path = output_dir / "labels.csv"

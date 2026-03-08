@@ -255,7 +255,7 @@ def test_cli_label_progress_output(mock_clip, tmp_path, capsys):
     config_path, images_dir = _make_label_workspace(tmp_path)
     main(["label", "--images", str(images_dir), "--config", str(config_path)])
     captured = capsys.readouterr()
-    assert "Scoring 2 images" in captured.out
+    assert "Labeling 2 images" in captured.out
     assert "[1/2] img1.jpg" in captured.out
     assert "[2/2] img2.jpg" in captured.out
     assert "labels.csv" in captured.out
