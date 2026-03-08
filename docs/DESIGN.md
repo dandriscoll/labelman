@@ -32,7 +32,7 @@
 - Acting as a DAM, media browser, or general-purpose organizer.
 - Embedding storage-layer assumptions (database, specific filesystem layout beyond conventions).
 - Requiring a particular ML framework or runtime beyond the ability to invoke scripts.
-- Real-time or interactive labeling UIs.
+- Production-grade web application hosting (the built-in UI is a local development tool).
 
 ---
 
@@ -304,6 +304,74 @@ The check scenario validates `labelman.yaml` for structural correctness and sema
 - Check is fast and offline. No images, no models, no integration scripts.
 - Check should be runnable in CI or as a pre-commit hook.
 - Check validates only the current `labelman.yaml`. It does not compare to previous versions.
+
+---
+
+### Scenario 5: UI (Manual Labeling Web Interface)
+
+**Command:** `labelman ui [--images <path>] [--host HOST] [--port PORT]`
+
+**Behavior:**
+
+1. Scans the image directory for supported image files (`.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tiff`).
+2. Starts a lightweight web server (Python stdlib `http.server`, no external dependencies).
+3. Serves an embedded single-page application accessible via browser.
+4. The user browses images, views labels, and edits manual labels through the interface.
+5. All changes are written immediately to manual label sidecar files (`.labels.txt`).
+6. The server can be stopped with Ctrl+C. No state is stored outside the dataset directory.
+
+**Docker usage:**
+
+```bash
+docker build -t labelman-ui .
+docker run -p 8080:8080 -v $(pwd):/dataset labelman-ui
+```
+
+The container runs the web server, mounts the dataset directory, and exposes the interface on port 8080. The container is ephemeral — all persistent data lives in the mounted dataset directory.
+
+**Dataset directory requirements:**
+
+The mounted directory must contain image files. Manual label sidecars (`.labels.txt`) are read from and written to this directory. The server creates sidecar files as needed when labels are added.
+
+**Manual sidecar editing behavior:**
+
+The UI reads and writes only manual label sidecars (`{image_stem}.labels.txt`). It does not modify detected labels, `labelman.yaml`, or any other files. Sidecar format is one label per line, matching the format described in §9.
+
+**API endpoints:**
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | HTML single-page application |
+| `GET` | `/api/images?page=N&per_page=M` | Paginated image listing with label counts |
+| `GET` | `/api/images/<name>/thumb` | Serve image file |
+| `GET` | `/api/images/<name>/labels` | Get manual labels for an image |
+| `PUT` | `/api/images/<name>/labels` | Update manual labels for an image |
+| `POST` | `/api/bulk/labels` | Bulk add/remove labels across multiple images |
+| `POST` | `/api/refresh` | Re-scan the dataset directory |
+
+**Keyboard navigation:**
+
+| Key | Action |
+|---|---|
+| `→` / `↓` / `j` | Next image |
+| `←` / `↑` / `k` | Previous image |
+| `Space` | Toggle selection (for bulk operations) |
+| `Shift+Space` / `Shift+Click` | Range selection |
+| `Enter` | Focus label input field |
+| `Escape` | Clear selection |
+| `Ctrl+A` | Select all images on current page |
+
+**Bulk labeling:**
+
+Select multiple images using checkboxes or keyboard, then use the bulk bar to add or remove a label across all selected images simultaneously. Bulk operations call `POST /api/bulk/labels` which updates each image's manual sidecar.
+
+**Key properties:**
+
+- The UI modifies only manual label sidecars. Detection logic, thresholds, and `labelman.yaml` are never altered.
+- Results are paginated (default 50 per page) for performance with large datasets.
+- Images are lazy-loaded with thumbnail previews.
+- Path traversal attacks are prevented — only files within the configured dataset directory are served.
+- This is a local development tool. It binds to `127.0.0.1` by default and should not be exposed to untrusted networks without additional security measures.
 
 ---
 

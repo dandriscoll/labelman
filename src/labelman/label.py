@@ -67,20 +67,17 @@ def load_manual_sidecar(image_path: str) -> list[str]:
     """Load manual labels from a .labels.txt sidecar file if it exists.
 
     Sidecar naming: for image_001.jpg, the sidecar is image_001.labels.txt.
-    Format: one label per line, whitespace-trimmed, blank lines ignored.
+    Format: comma-separated labels, whitespace-trimmed, empty entries ignored.
     Returns an empty list if no sidecar exists.
     """
     p = Path(image_path)
     sidecar = p.with_suffix(".labels.txt")
     if not sidecar.is_file():
         return []
-    lines = sidecar.read_text().splitlines()
-    labels = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped:
-            labels.append(stripped)
-    return labels
+    text = sidecar.read_text().strip()
+    if not text:
+        return []
+    return [label.strip() for label in text.split(",") if label.strip()]
 
 
 def assemble_final_labels(
@@ -110,11 +107,20 @@ def assemble_final_labels(
     if manual_labels is None:
         manual_labels = []
 
-    # Merge in order: global, manual, detected — deduplicate
+    # Separate suppression directives (-term) from additive manual labels
+    suppressions: set[str] = set()
+    additive_manual: list[str] = []
+    for label in manual_labels:
+        if label.startswith("-"):
+            suppressions.add(label[1:])
+        else:
+            additive_manual.append(label)
+
+    # Merge in order: global, manual, detected — deduplicate and suppress
     merged: list[str] = []
     seen: set[str] = set()
-    for label in [*term_list.global_terms, *manual_labels, *detected_flat]:
-        if label not in seen:
+    for label in [*term_list.global_terms, *additive_manual, *detected_flat]:
+        if label not in seen and label not in suppressions:
             merged.append(label)
             seen.add(label)
 

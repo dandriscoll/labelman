@@ -317,7 +317,7 @@ def test_load_manual_sidecar_valid(tmp_path):
     img = tmp_path / "photo.jpg"
     img.write_text("")
     sidecar = tmp_path / "photo.labels.txt"
-    sidecar.write_text("tail number n123ab\nred stripe livery\n")
+    sidecar.write_text("tail number n123ab, red stripe livery")
     labels = load_manual_sidecar(str(img))
     assert labels == ["tail number n123ab", "red stripe livery"]
 
@@ -326,7 +326,7 @@ def test_load_manual_sidecar_whitespace_and_blanks(tmp_path):
     img = tmp_path / "photo.jpg"
     img.write_text("")
     sidecar = tmp_path / "photo.labels.txt"
-    sidecar.write_text("  tail number n123ab  \n\n\n  red stripe  \n  \n")
+    sidecar.write_text("  tail number n123ab  ,  ,  red stripe  ,  ")
     labels = load_manual_sidecar(str(img))
     assert labels == ["tail number n123ab", "red stripe"]
 
@@ -456,3 +456,49 @@ def test_assemble_caption_includes_all_sources():
     assert "custom tag" in caption
     assert "single" in caption
     assert ", " in caption
+
+
+# --- Suppression via -term ---
+
+def test_assemble_suppress_detected_label():
+    """-term in manual labels suppresses that term from final output."""
+    tl = _parse(TAXONOMY)
+    scores = {"count": {"single": 0.9, "group": 0.1}, "mood": {"calm": 0.5, "energetic": 0.1}}
+    manual = ["-calm"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "calm" not in result.final_labels
+    assert "-calm" not in result.final_labels
+    assert "single" in result.final_labels
+
+
+def test_assemble_suppress_global_label():
+    """-term can suppress a global label."""
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    scores = {"count": {"single": 0.9, "group": 0.1}}
+    manual = ["-aircraft"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "aircraft" not in result.final_labels
+    assert "-aircraft" not in result.final_labels
+    assert "mooney m20" in result.final_labels
+
+
+def test_assemble_suppress_with_additive():
+    """Suppression and additive labels coexist."""
+    tl = _parse(TAXONOMY)
+    scores = {"count": {"single": 0.9, "group": 0.1}, "mood": {"calm": 0.5, "energetic": 0.4}}
+    manual = ["custom tag", "-calm"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "custom tag" in result.final_labels
+    assert "calm" not in result.final_labels
+    assert "-calm" not in result.final_labels
+    assert "energetic" in result.final_labels
+
+
+def test_assemble_suppress_nonexistent_is_harmless():
+    """-term for a term that doesn't exist is a no-op."""
+    tl = _parse(TAXONOMY)
+    scores = {"count": {"single": 0.9, "group": 0.1}}
+    manual = ["-nonexistent"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "-nonexistent" not in result.final_labels
+    assert "single" in result.final_labels

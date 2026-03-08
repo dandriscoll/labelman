@@ -14,6 +14,7 @@ from .integrations import get_descriptor, run_clip
 from .label import assemble_final_labels, load_manual_sidecar, write_csv, write_report, write_sidecar
 from .schema import parse
 from .suggest import bootstrap, expand, format_suggest_result
+from .web import serve as web_serve
 
 
 DEFAULT_CONFIG = "labelman.yaml"
@@ -353,6 +354,16 @@ def cmd_label(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ui(args: argparse.Namespace) -> int:
+    images_path = Path(args.images)
+    if not images_path.is_dir():
+        print(f"Error: {images_path} is not a directory", file=sys.stderr)
+        return 1
+
+    web_serve(images_path, host=args.host, port=args.port)
+    return 0
+
+
 def cmd_descriptor(args: argparse.Namespace) -> int:
     tool = args.tool
     try:
@@ -395,6 +406,12 @@ def build_parser() -> argparse.ArgumentParser:
     label_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
     label_p.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
 
+    # ui
+    ui_p = sub.add_parser("ui", help="Launch web-based labeling interface")
+    ui_p.add_argument("--images", default=".", help="Directory containing images")
+    ui_p.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+    ui_p.add_argument("--port", type=int, default=7933, help="Port to bind to (default: 7933)")
+
     # descriptor
     desc_p = sub.add_parser("descriptor", help="Print a Boutiques descriptor for a built-in integration")
     desc_p.add_argument("tool", choices=["blip", "clip"], help="Integration name")
@@ -415,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
         "check": cmd_check,
         "suggest": cmd_suggest,
         "label": cmd_label,
+        "ui": cmd_ui,
         "descriptor": cmd_descriptor,
     }
     return handlers[args.command](args)
