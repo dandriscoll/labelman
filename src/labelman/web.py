@@ -465,31 +465,34 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .controls button:hover { background: #1a5276; }
 .controls button.active { background: #e94560; border-color: #e94560; }
 .image-list { flex: 1; overflow-y: auto; padding: 4px; }
-.image-list.grid-view { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 4px; align-content: start; }
 .image-item { display: flex; align-items: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; gap: 8px; margin-bottom: 2px; border: 2px solid transparent; user-select: none; }
 .image-item:hover { background: #1a3a5c; }
 .image-item.focused { border-color: #e94560; background: #1a3a5c; }
 .image-item.selected { background: #2a1a3e; border-color: #9b59b6; }
-.image-item .thumb { width: 40px; height: 40px; object-fit: cover; border-radius: 4px; background: #333; flex-shrink: 0; }
+.image-item .thumb { width: var(--list-thumb, 40px); height: var(--list-thumb, 40px); object-fit: cover; border-radius: 4px; background: #333; flex-shrink: 0; }
 .image-item .info { flex: 1; min-width: 0; }
 .image-item .name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .image-item .label-count { font-size: 11px; color: #888; }
 .image-item .label-count.has-labels { color: #4caf50; }
-.grid-view .image-item { flex-direction: column; padding: 4px; margin-bottom: 0; gap: 2px; }
-.grid-view .image-item .thumb { width: 100%; height: 70px; border-radius: 4px; }
-.grid-view .image-item .info { width: 100%; }
-.grid-view .image-item .name { font-size: 10px; text-align: center; }
-.grid-view .image-item .label-count { font-size: 9px; text-align: center; }
+.grid-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.grid-toolbar { padding: 8px 16px; background: #16213e; border-bottom: 1px solid #333; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grid-toolbar button, .grid-toolbar select { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+.grid-toolbar button:hover { background: #1a5276; }
+.grid-toolbar button:disabled { opacity: 0.3; cursor: not-allowed; }
+.grid-toolbar .spacer { flex: 1; }
+.grid-toolbar .sel-info { font-size: 12px; color: #888; }
+.grid-container { flex: 1; overflow-y: auto; padding: 8px; display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--grid-size, 160px), 1fr)); gap: 6px; align-content: start; }
+.grid-container .image-item { flex-direction: column; padding: 4px; margin-bottom: 0; gap: 2px; }
+.grid-container .image-item .thumb { width: 100%; height: var(--thumb-height, 120px); border-radius: 4px; }
+.grid-container .image-item .info { width: 100%; }
+.grid-container .image-item .name { font-size: 11px; text-align: center; }
+.grid-container .image-item .label-count { font-size: 10px; text-align: center; }
 .pagination { padding: 8px 12px; border-top: 1px solid #333; display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
 .pagination button { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 4px 12px; border-radius: 4px; cursor: pointer; }
 .pagination button:disabled { opacity: 0.3; cursor: not-allowed; }
 .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .main-header { padding: 8px 16px; background: #16213e; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; min-height: 44px; }
 .main-header .title { font-size: 14px; font-weight: 600; }
-.bulk-bar { padding: 8px 16px; background: #2a1a3e; border-bottom: 1px solid #533; display: flex; gap: 8px; align-items: center; }
-.bulk-bar input { background: #1a1a2e; color: #e0e0e0; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; font-size: 13px; flex: 1; }
-.bulk-bar button { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-.bulk-bar button.danger { background: #8b0000; }
 .main-content { flex: 1; display: flex; overflow: hidden; }
 .preview { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #111; }
 .preview img { max-width: 100%; max-height: 100%; object-fit: contain; }
@@ -549,6 +552,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         <option value="100">100</option>
         <option value="200">200</option>
       </select>
+      <input id="list-zoom" type="range" min="24" max="120" value="40" style="width:80px;accent-color:#e94560;cursor:pointer" title="Zoom">
     </div>
     <div class="image-list" id="image-list"></div>
     <div class="pagination">
@@ -565,6 +569,27 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     <div class="main-content">
       <div class="preview" id="preview">
         <span class="empty">Select an image to preview</span>
+      </div>
+      <div class="grid-area" id="grid-area" style="display:none">
+        <div class="grid-toolbar">
+          <button id="btn-grid-list">List</button>
+          <button id="btn-grid-undo" disabled title="Undo selection (Ctrl+Z)">Undo</button>
+          <button id="btn-grid-redo" disabled title="Redo selection (Ctrl+Y)">Redo</button>
+          <button id="btn-grid-refresh">Refresh</button>
+          <select id="grid-per-page">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+          </select>
+          <input id="grid-zoom" type="range" min="80" max="400" value="160" style="width:100px;accent-color:#e94560;cursor:pointer" title="Zoom">
+          <span class="spacer"></span>
+          <span class="sel-info" id="grid-sel-info"></span>
+          <span id="grid-page-info" style="font-size:12px;color:#888"></span>
+          <button id="btn-grid-prev" disabled>&larr;</button>
+          <button id="btn-grid-next" disabled>&rarr;</button>
+        </div>
+        <div class="grid-container" id="grid-container"></div>
       </div>
       <div class="label-panel" id="label-panel">
         <h3>Labels</h3>
@@ -612,6 +637,35 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   let viewMode = 'list'; // 'list' or 'grid'
   let multiLabelData = {}; // {name: {manual: [], detected: []}}
 
+  // Selection undo/redo stacks
+  let selUndoStack = [];
+  let selRedoStack = [];
+  function pushSelState() {
+    selUndoStack.push(new Set(selectedSet));
+    selRedoStack = [];
+    updateSelButtons();
+  }
+  function selUndo() {
+    if (selUndoStack.length === 0) return;
+    selRedoStack.push(new Set(selectedSet));
+    selectedSet = selUndoStack.pop();
+    updateSelButtons();
+    renderGrid();
+    onSelectionChanged();
+  }
+  function selRedo() {
+    if (selRedoStack.length === 0) return;
+    selUndoStack.push(new Set(selectedSet));
+    selectedSet = selRedoStack.pop();
+    updateSelButtons();
+    renderGrid();
+    onSelectionChanged();
+  }
+  function updateSelButtons() {
+    document.getElementById('btn-grid-undo').disabled = selUndoStack.length === 0;
+    document.getElementById('btn-grid-redo').disabled = selRedoStack.length === 0;
+  }
+
   const $list = document.getElementById('image-list');
   const $stats = document.getElementById('stats');
   const $pageInfo = document.getElementById('page-info');
@@ -624,6 +678,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   const $rawManual = document.getElementById('raw-manual');
   const $rawDetected = document.getElementById('raw-detected');
   const $saveStatus = document.getElementById('save-status');
+  const $sidebar = document.querySelector('.sidebar');
+  const $gridArea = document.getElementById('grid-area');
+  const $gridContainer = document.getElementById('grid-container');
 
   async function api(url, opts) {
     const r = await fetch(url, opts);
@@ -638,47 +695,65 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     total = data.total;
     pages = data.pages;
     $stats.textContent = `${total} images`;
-    $pageInfo.textContent = `${page} / ${pages}`;
-    document.getElementById('btn-prev').disabled = page <= 1;
-    document.getElementById('btn-next').disabled = page >= pages;
-    renderList();
-    if (viewMode === 'list' && images.length > 0 && focusIdx < 0) {
-      focusIdx = 0;
-      selectImage(0);
-    } else if (focusIdx >= images.length) {
-      focusIdx = Math.max(0, images.length - 1);
+    if (viewMode === 'list') {
+      $pageInfo.textContent = `${page} / ${pages}`;
+      document.getElementById('btn-prev').disabled = page <= 1;
+      document.getElementById('btn-next').disabled = page >= pages;
+      renderList();
+      if (images.length > 0 && focusIdx < 0) {
+        focusIdx = 0;
+        selectImage(0);
+      } else if (focusIdx >= images.length) {
+        focusIdx = Math.max(0, images.length - 1);
+      }
+    } else {
+      document.getElementById('grid-page-info').textContent = `${page} / ${pages}`;
+      document.getElementById('btn-grid-prev').disabled = page <= 1;
+      document.getElementById('btn-grid-next').disabled = page >= pages;
+      renderGrid();
     }
   }
 
   function renderList() {
     $list.innerHTML = '';
-    $list.className = viewMode === 'grid' ? 'image-list grid-view' : 'image-list';
     images.forEach((img, i) => {
       const el = document.createElement('div');
-      const isFocused = viewMode === 'list' && i === focusIdx;
-      const isSelected = viewMode === 'grid' && selectedSet.has(img.name);
-      el.className = 'image-item' + (isFocused ? ' focused' : '') + (isSelected ? ' selected' : '');
+      el.className = 'image-item' + (i === focusIdx ? ' focused' : '');
       el.innerHTML = `
         <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
         <div class="info">
           <div class="name" title="${img.name}">${img.name}</div>
           <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
         </div>`;
-      el.addEventListener('click', (e) => {
-        if (viewMode === 'grid') {
-          handleGridClick(i, e);
-        } else {
-          focusIdx = i;
-          selectedSet.clear();
-          selectImage(i);
-          renderList();
-        }
+      el.addEventListener('click', () => {
+        focusIdx = i;
+        selectImage(i);
+        renderList();
       });
       $list.appendChild(el);
     });
   }
 
+  function renderGrid() {
+    $gridContainer.innerHTML = '';
+    const selInfo = document.getElementById('grid-sel-info');
+    selInfo.textContent = selectedSet.size > 0 ? `${selectedSet.size} selected` : `${total} images`;
+    images.forEach((img, i) => {
+      const el = document.createElement('div');
+      el.className = 'image-item' + (selectedSet.has(img.name) ? ' selected' : '');
+      el.innerHTML = `
+        <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
+        <div class="info">
+          <div class="name" title="${img.name}">${img.name}</div>
+          <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
+        </div>`;
+      el.addEventListener('click', (e) => handleGridClick(i, e));
+      $gridContainer.appendChild(el);
+    });
+  }
+
   function handleGridClick(idx, e) {
+    pushSelState();
     const name = images[idx].name;
     if (e.shiftKey && lastShiftIdx >= 0) {
       const start = Math.min(lastShiftIdx, idx);
@@ -695,7 +770,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     }
     lastShiftIdx = idx;
     focusIdx = idx;
-    renderList();
+    renderGrid();
     onSelectionChanged();
   }
 
@@ -703,21 +778,18 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const names = Array.from(selectedSet);
     if (names.length === 0) {
       $currentName.textContent = 'No image selected';
-      $preview.innerHTML = '<span class="empty">Select an image to preview</span>';
       $labelSection.innerHTML = '<p style="color:#666;font-size:12px;padding:8px 0">Select an image to view labels</p>';
       $addSection.style.display = 'none';
       $rawSection.style.display = 'none';
       document.getElementById('delete-section').style.display = 'none';
     } else if (names.length === 1) {
       $currentName.textContent = names[0];
-      $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(names[0])}/thumb" />`;
       $addSection.style.display = 'block';
       $rawSection.style.display = 'block';
       document.getElementById('delete-section').style.display = 'block';
       loadLabels(names[0]);
     } else {
       $currentName.textContent = `${names.length} images selected`;
-      $preview.innerHTML = `<span class="empty">${names.length} images selected</span>`;
       $addSection.style.display = 'block';
       $rawSection.style.display = 'none';
       document.getElementById('delete-section').style.display = 'none';
@@ -734,6 +806,33 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     $rawSection.style.display = 'block';
     document.getElementById('delete-section').style.display = 'block';
     loadLabels(img.name);
+  }
+
+  function setViewMode(mode) {
+    viewMode = mode;
+    selectedSet.clear();
+    selUndoStack = [];
+    selRedoStack = [];
+    updateSelButtons();
+    if (viewMode === 'list') {
+      $sidebar.style.display = '';
+      $preview.style.display = '';
+      $gridArea.style.display = 'none';
+      document.getElementById('btn-view-toggle').textContent = 'Grid';
+      if (focusIdx < 0 && images.length > 0) focusIdx = 0;
+      perPage = parseInt(document.getElementById('per-page').value);
+      page = 1;
+      loadImages();
+    } else {
+      $sidebar.style.display = 'none';
+      $preview.style.display = 'none';
+      $gridArea.style.display = '';
+      document.getElementById('btn-view-toggle').textContent = 'Grid';
+      perPage = parseInt(document.getElementById('grid-per-page').value);
+      page = 1;
+      loadImages();
+      onSelectionChanged();
+    }
   }
 
   async function loadLabels(name) {
@@ -1089,7 +1188,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       const totalCount = currentLabels.length + detectedLabels.length;
       img.label_count = totalCount;
       img.has_labels = totalCount > 0;
-      renderList();
+      if (viewMode === 'grid') renderGrid(); else renderList();
     }
   }
 
@@ -1126,35 +1225,59 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     return d.innerHTML;
   }
 
-  // Keyboard navigation
+  // Keyboard navigation (list mode only)
   function navNext() {
     if (focusIdx < images.length - 1) {
       focusIdx++;
-      if (viewMode === 'list') { selectImage(focusIdx); }
-      renderList();
-      scrollToFocused();
     } else if (page < pages) {
       page++;
       focusIdx = 0;
-      loadImages().then(() => { if (viewMode === 'list') selectImage(0); });
+      loadImages().then(() => navApply());
+      return;
+    } else {
+      return;
     }
+    navApply();
   }
   function navPrev() {
     if (focusIdx > 0) {
       focusIdx--;
-      if (viewMode === 'list') { selectImage(focusIdx); }
-      renderList();
-      scrollToFocused();
     } else if (page > 1) {
       page--;
-      loadImages().then(() => {
-        focusIdx = images.length - 1;
-        if (viewMode === 'list') { selectImage(focusIdx); }
-        renderList();
-      });
+      loadImages().then(() => { focusIdx = images.length - 1; navApply(); });
+      return;
+    } else {
+      return;
+    }
+    navApply();
+  }
+  function navApply() {
+    if (viewMode === 'list') {
+      selectImage(focusIdx);
+      renderList();
+      scrollToFocused();
+    } else {
+      pushSelState();
+      selectedSet.clear();
+      selectedSet.add(images[focusIdx].name);
+      renderGrid();
+      onSelectionChanged();
+      const el = $gridContainer.children[focusIdx];
+      if (el) el.scrollIntoView({block: 'nearest'});
     }
   }
   document.addEventListener('keydown', (e) => {
+    // Ctrl+Z/Y for selection undo/redo in grid mode
+    if (viewMode === 'grid' && e.ctrlKey && e.key === 'z' && !(e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
+      e.preventDefault();
+      selUndo();
+      return;
+    }
+    if (viewMode === 'grid' && e.ctrlKey && e.key === 'y' && !(e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
+      e.preventDefault();
+      selRedo();
+      return;
+    }
     if (e.ctrlKey && (e.key === 'ArrowRight' || e.key === 'ArrowDown')) {
       e.preventDefault();
       navNext();
@@ -1188,15 +1311,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       $addInput.focus();
     }
     if (e.key === 'Escape') {
-      selectedSet.clear();
-      renderList();
-      if (viewMode === 'grid') onSelectionChanged();
+      if (viewMode === 'grid') {
+        pushSelState();
+        selectedSet.clear();
+        renderGrid();
+        onSelectionChanged();
+      }
     }
     if (e.key === 'a' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       if (viewMode === 'grid') {
+        pushSelState();
         images.forEach(img => selectedSet.add(img.name));
-        renderList();
+        renderGrid();
         onSelectionChanged();
       }
     }
@@ -1210,25 +1337,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   });
 
   function scrollToFocused() {
-    const el = $list.querySelector('.focused') || $list.querySelector('.selected');
+    const el = $list.querySelector('.focused');
     if (el) el.scrollIntoView({block: 'nearest'});
   }
 
-  // View toggle
-  document.getElementById('btn-view-toggle').addEventListener('click', () => {
-    viewMode = viewMode === 'list' ? 'grid' : 'list';
-    document.getElementById('btn-view-toggle').textContent = viewMode === 'list' ? 'Grid' : 'List';
-    selectedSet.clear();
-    if (viewMode === 'list') {
-      if (focusIdx < 0 && images.length > 0) focusIdx = 0;
-      if (focusIdx >= 0) selectImage(focusIdx);
-    } else {
-      onSelectionChanged();
-    }
-    renderList();
-  });
+  // View toggle (sidebar button)
+  document.getElementById('btn-view-toggle').addEventListener('click', () => setViewMode('grid'));
+  // Grid toolbar back to list
+  document.getElementById('btn-grid-list').addEventListener('click', () => setViewMode('list'));
+  // Grid undo/redo
+  document.getElementById('btn-grid-undo').addEventListener('click', selUndo);
+  document.getElementById('btn-grid-redo').addEventListener('click', selRedo);
 
-  // Event listeners
+  // Event listeners - sidebar (list mode)
   document.getElementById('btn-prev').addEventListener('click', () => { if (page > 1) { page--; loadImages(); } });
   document.getElementById('btn-next').addEventListener('click', () => { if (page < pages) { page++; loadImages(); } });
   document.getElementById('btn-refresh').addEventListener('click', async () => {
@@ -1241,6 +1362,28 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     loadImages();
   });
   document.getElementById('btn-add').addEventListener('click', addLabel);
+  document.getElementById('list-zoom').addEventListener('input', (e) => {
+    const sz = parseInt(e.target.value);
+    $list.style.setProperty('--list-thumb', sz + 'px');
+  });
+
+  // Event listeners - grid toolbar
+  document.getElementById('btn-grid-prev').addEventListener('click', () => { if (page > 1) { page--; loadImages(); } });
+  document.getElementById('btn-grid-next').addEventListener('click', () => { if (page < pages) { page++; loadImages(); } });
+  document.getElementById('btn-grid-refresh').addEventListener('click', async () => {
+    await api('/api/refresh', {method: 'POST'});
+    await loadImages();
+  });
+  document.getElementById('grid-per-page').addEventListener('change', (e) => {
+    perPage = parseInt(e.target.value);
+    page = 1;
+    loadImages();
+  });
+  document.getElementById('grid-zoom').addEventListener('input', (e) => {
+    const sz = parseInt(e.target.value);
+    $gridContainer.style.setProperty('--grid-size', sz + 'px');
+    $gridContainer.style.setProperty('--thumb-height', Math.round(sz * 0.75) + 'px');
+  });
 
   // Auto-save raw text fields with debounce (single-select only)
   let rawManualTimer = null;
@@ -1282,8 +1425,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     await loadImages();
     if (focusIdx >= images.length) focusIdx = Math.max(0, images.length - 1);
     if (images.length > 0) {
-      if (viewMode === 'list') { selectImage(focusIdx); }
-      renderList();
+      if (viewMode === 'list') { selectImage(focusIdx); renderList(); }
     } else {
       $currentName.textContent = 'No image selected';
       $preview.innerHTML = '<span class="empty">No images remaining</span>';
