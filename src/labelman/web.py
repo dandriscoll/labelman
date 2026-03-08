@@ -465,16 +465,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .controls button:hover { background: #1a5276; }
 .controls button.active { background: #e94560; border-color: #e94560; }
 .image-list { flex: 1; overflow-y: auto; padding: 4px; }
-.image-item { display: flex; align-items: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; gap: 8px; margin-bottom: 2px; border: 2px solid transparent; }
+.image-list.grid-view { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 4px; align-content: start; }
+.image-item { display: flex; align-items: center; padding: 6px 8px; border-radius: 6px; cursor: pointer; gap: 8px; margin-bottom: 2px; border: 2px solid transparent; user-select: none; }
 .image-item:hover { background: #1a3a5c; }
 .image-item.focused { border-color: #e94560; background: #1a3a5c; }
-.image-item.selected { background: #2a1a3e; }
-.image-item .cb { flex-shrink: 0; }
+.image-item.selected { background: #2a1a3e; border-color: #9b59b6; }
 .image-item .thumb { width: 40px; height: 40px; object-fit: cover; border-radius: 4px; background: #333; flex-shrink: 0; }
 .image-item .info { flex: 1; min-width: 0; }
 .image-item .name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .image-item .label-count { font-size: 11px; color: #888; }
 .image-item .label-count.has-labels { color: #4caf50; }
+.grid-view .image-item { flex-direction: column; padding: 4px; margin-bottom: 0; gap: 2px; }
+.grid-view .image-item .thumb { width: 100%; height: 70px; border-radius: 4px; }
+.grid-view .image-item .info { width: 100%; }
+.grid-view .image-item .name { font-size: 10px; text-align: center; }
+.grid-view .image-item .label-count { font-size: 9px; text-align: center; }
 .pagination { padding: 8px 12px; border-top: 1px solid #333; display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
 .pagination button { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 4px 12px; border-radius: 4px; cursor: pointer; }
 .pagination button:disabled { opacity: 0.3; cursor: not-allowed; }
@@ -517,6 +522,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .term-btn:hover { border-color: #666; color: #ddd; }
 .term-btn.detected { background: #1a2a3e; border-color: #2980b9; color: #5dade2; }
 .term-btn.active { background: #1e2a1e; border-color: #4caf50; color: #6c6; }
+.term-btn.partial { background: #2a2a1e; border-color: #b8860b; color: #daa520; }
 .term-btn.suppressed { background: #2a1a1e; border-color: #e94560; color: #e94560; text-decoration: line-through; opacity: 0.7; }
 .term-btn .term-remove { font-size: 11px; color: #e94560; margin-left: 2px; }
 .add-label { display: flex; gap: 4px; margin-top: 8px; }
@@ -535,8 +541,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       <div class="stats" id="stats">Loading...</div>
     </div>
     <div class="controls">
-      <button id="btn-select-all">Select All</button>
-      <button id="btn-deselect">Deselect</button>
+      <button id="btn-view-toggle">Grid</button>
       <button id="btn-refresh">Refresh</button>
       <select id="per-page">
         <option value="25">25</option>
@@ -556,12 +561,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     <div class="main-header">
       <span class="title" id="current-name">No image selected</span>
       <span id="save-status" style="font-size:12px;color:#4caf50"></span>
-    </div>
-    <div class="bulk-bar" id="bulk-bar" style="display:none">
-      <span id="bulk-count">0 selected</span>
-      <input id="bulk-input" placeholder="Label to add/remove..." />
-      <button id="btn-bulk-add">+ Add</button>
-      <button id="btn-bulk-remove" class="danger">- Remove</button>
     </div>
     <div class="main-content">
       <div class="preview" id="preview">
@@ -610,6 +609,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   let detectedLabels = [];
   let taxonomy = null;
   let lastShiftIdx = -1;
+  let viewMode = 'list'; // 'list' or 'grid'
+  let multiLabelData = {}; // {name: {manual: [], detected: []}}
 
   const $list = document.getElementById('image-list');
   const $stats = document.getElementById('stats');
@@ -617,9 +618,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   const $preview = document.getElementById('preview');
   const $labelSection = document.getElementById('label-section');
   const $currentName = document.getElementById('current-name');
-  const $bulkBar = document.getElementById('bulk-bar');
-  const $bulkCount = document.getElementById('bulk-count');
-  const $bulkInput = document.getElementById('bulk-input');
   const $addInput = document.getElementById('add-input');
   const $addSection = document.getElementById('add-section');
   const $rawSection = document.getElementById('raw-section');
@@ -632,6 +630,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     return r.json();
   }
 
+  function isMultiSelect() { return viewMode === 'grid' && selectedSet.size > 1; }
+
   async function loadImages() {
     const data = await api(`/api/images?page=${page}&per_page=${perPage}`);
     images = data.images;
@@ -642,7 +642,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     document.getElementById('btn-prev').disabled = page <= 1;
     document.getElementById('btn-next').disabled = page >= pages;
     renderList();
-    if (images.length > 0 && focusIdx < 0) {
+    if (viewMode === 'list' && images.length > 0 && focusIdx < 0) {
       focusIdx = 0;
       selectImage(0);
     } else if (focusIdx >= images.length) {
@@ -652,48 +652,77 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 
   function renderList() {
     $list.innerHTML = '';
+    $list.className = viewMode === 'grid' ? 'image-list grid-view' : 'image-list';
     images.forEach((img, i) => {
       const el = document.createElement('div');
-      el.className = 'image-item' + (i === focusIdx ? ' focused' : '') + (selectedSet.has(img.name) ? ' selected' : '');
+      const isFocused = viewMode === 'list' && i === focusIdx;
+      const isSelected = viewMode === 'grid' && selectedSet.has(img.name);
+      el.className = 'image-item' + (isFocused ? ' focused' : '') + (isSelected ? ' selected' : '');
       el.innerHTML = `
-        <input type="checkbox" class="cb" ${selectedSet.has(img.name) ? 'checked' : ''} />
         <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
         <div class="info">
           <div class="name" title="${img.name}">${img.name}</div>
           <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
         </div>`;
       el.addEventListener('click', (e) => {
-        if (e.target.classList.contains('cb')) {
-          toggleSelect(i, e.shiftKey);
-          return;
+        if (viewMode === 'grid') {
+          handleGridClick(i, e);
+        } else {
+          focusIdx = i;
+          selectedSet.clear();
+          selectImage(i);
+          renderList();
         }
-        focusIdx = i;
-        selectImage(i);
-        renderList();
-      });
-      el.querySelector('.cb').addEventListener('change', (e) => {
-        e.stopPropagation();
-        toggleSelect(i, e.shiftKey);
       });
       $list.appendChild(el);
     });
-    updateBulkBar();
   }
 
-  function toggleSelect(idx, shift) {
+  function handleGridClick(idx, e) {
     const name = images[idx].name;
-    if (shift && lastShiftIdx >= 0) {
+    if (e.shiftKey && lastShiftIdx >= 0) {
       const start = Math.min(lastShiftIdx, idx);
       const end = Math.max(lastShiftIdx, idx);
       for (let i = start; i <= end; i++) {
         selectedSet.add(images[i].name);
       }
-    } else {
+    } else if (e.ctrlKey || e.metaKey) {
       if (selectedSet.has(name)) selectedSet.delete(name);
       else selectedSet.add(name);
+    } else {
+      selectedSet.clear();
+      selectedSet.add(name);
     }
     lastShiftIdx = idx;
+    focusIdx = idx;
     renderList();
+    onSelectionChanged();
+  }
+
+  function onSelectionChanged() {
+    const names = Array.from(selectedSet);
+    if (names.length === 0) {
+      $currentName.textContent = 'No image selected';
+      $preview.innerHTML = '<span class="empty">Select an image to preview</span>';
+      $labelSection.innerHTML = '<p style="color:#666;font-size:12px;padding:8px 0">Select an image to view labels</p>';
+      $addSection.style.display = 'none';
+      $rawSection.style.display = 'none';
+      document.getElementById('delete-section').style.display = 'none';
+    } else if (names.length === 1) {
+      $currentName.textContent = names[0];
+      $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(names[0])}/thumb" />`;
+      $addSection.style.display = 'block';
+      $rawSection.style.display = 'block';
+      document.getElementById('delete-section').style.display = 'block';
+      loadLabels(names[0]);
+    } else {
+      $currentName.textContent = `${names.length} images selected`;
+      $preview.innerHTML = `<span class="empty">${names.length} images selected</span>`;
+      $addSection.style.display = 'block';
+      $rawSection.style.display = 'none';
+      document.getElementById('delete-section').style.display = 'none';
+      loadMultiLabels(names);
+    }
   }
 
   function selectImage(idx) {
@@ -714,25 +743,40 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     renderLabels(name);
   }
 
+  async function loadMultiLabels(names) {
+    multiLabelData = {};
+    const results = await Promise.all(names.map(n =>
+      api(`/api/images/${encodeURIComponent(n)}/labels`).then(d => ({name: n, data: d}))
+    ));
+    for (const r of results) {
+      multiLabelData[r.name] = {
+        manual: r.data.manual_labels || [],
+        detected: r.data.detected_labels || [],
+      };
+    }
+    renderBulkLabels(names);
+  }
+
   function renderLabels(name) {
     const additive = currentLabels.filter(l => !l.startsWith('-'));
     const suppressions = new Set(currentLabels.filter(l => l.startsWith('-')).map(l => l.slice(1)));
-    // Track which terms are covered by taxonomy categories
     const taxonomyTerms = new Set();
     let html = '';
 
-    // --- Taxonomy categories: clickable term buttons ---
     if (taxonomy && taxonomy.categories && taxonomy.categories.length > 0) {
       taxonomy.categories.forEach(cat => {
         const modeLabel = cat.mode === 'exactly-one' ? 'pick one' : cat.mode === 'zero-or-one' ? 'optional, pick one' : 'any';
         html += `<div class="cat-section"><div class="cat-header">${esc(cat.name)} <span class="cat-mode">${modeLabel}</span></div><div class="term-grid">`;
+        const isExclusive = cat.mode === 'exactly-one' || cat.mode === 'zero-or-one';
+        const hasManualSelection = isExclusive && cat.terms.some(t => additive.includes(t));
         cat.terms.forEach(term => {
           taxonomyTerms.add(term);
           const isManual = additive.includes(term);
           const isDetected = detectedLabels.includes(term);
           const isSuppressed = suppressions.has(term);
+          const isImplicitlySuppressed = !isSuppressed && !isManual && hasManualSelection;
           let cls = 'term-btn';
-          if (isSuppressed) cls += ' suppressed';
+          if (isSuppressed || isImplicitlySuppressed) cls += ' suppressed';
           else if (isManual) cls += ' active';
           else if (isDetected) cls += ' detected';
           html += `<button class="${cls}" data-term="${esc(term)}" data-cat="${esc(cat.name)}" data-mode="${cat.mode}">${esc(term)}</button>`;
@@ -741,7 +785,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       });
     }
 
-    // --- Extra manual labels not in any category ---
     const extraManual = additive.filter(l => !taxonomyTerms.has(l));
     if (extraManual.length > 0) {
       html += '<div class="divider"></div><h4>Other Manual Labels</h4>';
@@ -754,7 +797,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       });
     }
 
-    // --- Detected labels not in taxonomy ---
     const extraDetected = detectedLabels.filter(l => !taxonomyTerms.has(l));
     if (extraDetected.length > 0) {
       html += '<div class="divider"></div><h4>Detected (non-taxonomy)</h4>';
@@ -776,7 +818,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       });
     }
 
-    // --- No taxonomy fallback: show all manual/detected as before ---
     if (!taxonomy || !taxonomy.categories || taxonomy.categories.length === 0) {
       html = '<h4>Manual Labels</h4>';
       if (additive.length === 0) {
@@ -814,65 +855,165 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     }
 
     $labelSection.innerHTML = html;
-
-    // Update raw text fields
     $rawManual.value = currentLabels.join(', ');
     $rawDetected.value = detectedLabels.join(', ');
-
     bindLabelEvents(name);
   }
 
+  // --- Bulk / multi-select label rendering ---
+  function renderBulkLabels(names) {
+    const n = names.length;
+    // Aggregate: for each term, count how many images have it as manual/detected
+    function countTerm(term) {
+      let manual = 0, detected = 0, suppressed = 0;
+      for (const name of names) {
+        const d = multiLabelData[name];
+        if (!d) continue;
+        const additive = d.manual.filter(l => !l.startsWith('-'));
+        const supps = new Set(d.manual.filter(l => l.startsWith('-')).map(l => l.slice(1)));
+        if (supps.has(term)) suppressed++;
+        else if (additive.includes(term)) manual++;
+        else if (d.detected.includes(term)) detected++;
+      }
+      return {manual, detected, suppressed};
+    }
+    function countLabel(label) {
+      let count = 0;
+      for (const name of names) {
+        const d = multiLabelData[name];
+        if (!d) continue;
+        if (d.manual.includes(label)) count++;
+      }
+      return count;
+    }
+
+    const taxonomyTerms = new Set();
+    let html = '';
+
+    if (taxonomy && taxonomy.categories && taxonomy.categories.length > 0) {
+      taxonomy.categories.forEach(cat => {
+        const modeLabel = cat.mode === 'exactly-one' ? 'pick one' : cat.mode === 'zero-or-one' ? 'optional, pick one' : 'any';
+        html += `<div class="cat-section"><div class="cat-header">${esc(cat.name)} <span class="cat-mode">${modeLabel}</span></div><div class="term-grid">`;
+        cat.terms.forEach(term => {
+          taxonomyTerms.add(term);
+          const c = countTerm(term);
+          let cls = 'term-btn';
+          let badge = '';
+          if (c.manual === n) cls += ' active';
+          else if (c.manual > 0) { cls += ' partial'; badge = ` <span style="font-size:9px;opacity:0.7">${c.manual}/${n}</span>`; }
+          else if (c.detected > 0) { cls += ' detected'; badge = c.detected < n ? ` <span style="font-size:9px;opacity:0.7">${c.detected}/${n}</span>` : ''; }
+          if (c.suppressed === n) cls = 'term-btn suppressed';
+          else if (c.suppressed > 0 && c.manual === 0 && c.detected === 0) { cls = 'term-btn suppressed'; badge = ` <span style="font-size:9px;opacity:0.7">${c.suppressed}/${n}</span>`; }
+          html += `<button class="${cls}" data-term="${esc(term)}" data-cat="${esc(cat.name)}" data-mode="${cat.mode}">${esc(term)}${badge}</button>`;
+        });
+        html += '</div></div>';
+      });
+    }
+
+    // Collect all extra manual labels across selection
+    const allExtraManual = new Set();
+    for (const name of names) {
+      const d = multiLabelData[name];
+      if (!d) continue;
+      for (const l of d.manual) {
+        if (!l.startsWith('-') && !taxonomyTerms.has(l)) allExtraManual.add(l);
+      }
+    }
+    if (allExtraManual.size > 0) {
+      html += '<div class="divider"></div><h4>Other Manual Labels</h4>';
+      for (const l of allExtraManual) {
+        const c = countLabel(l);
+        const badge = c < n ? ` <span style="font-size:9px;color:#888">${c}/${n}</span>` : '';
+        html += `<div class="label-row manual">
+          <span class="label-text" title="${esc(l)}">${esc(l)}${badge}</span>
+          <div class="actions"><button class="label-btn remove" data-bulk-label="${esc(l)}">&times;</button></div>
+        </div>`;
+      }
+    }
+
+    $labelSection.innerHTML = html;
+    bindBulkLabelEvents(names);
+  }
+
+  function bindBulkLabelEvents(names) {
+    $labelSection.querySelectorAll('.term-btn').forEach(el => {
+      el.addEventListener('click', async () => {
+        const term = el.dataset.term;
+        const mode = el.dataset.mode;
+        const cat = el.dataset.cat;
+        const isAll = el.classList.contains('active');
+        $saveStatus.textContent = 'Saving...';
+        if (isAll) {
+          // Remove from all
+          await api('/api/bulk/labels', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({images: names, remove: [term]}),
+          });
+        } else {
+          // Add to all; for exclusive categories, remove siblings first
+          const payload = {images: names, add: [term]};
+          if (mode === 'exactly-one' || mode === 'zero-or-one') {
+            const catDef = taxonomy && taxonomy.categories.find(c => c.name === cat);
+            if (catDef) {
+              payload.remove = catDef.terms.filter(t => t !== term);
+            }
+          }
+          await api('/api/bulk/labels', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload),
+          });
+        }
+        $saveStatus.textContent = 'Saved';
+        setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
+        await loadMultiLabels(names);
+      });
+    });
+    $labelSection.querySelectorAll('.label-btn.remove[data-bulk-label]').forEach(el => {
+      el.addEventListener('click', async () => {
+        const label = el.dataset.bulkLabel;
+        $saveStatus.textContent = 'Saving...';
+        await api('/api/bulk/labels', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({images: names, remove: [label]}),
+        });
+        $saveStatus.textContent = 'Saved';
+        setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
+        await loadMultiLabels(names);
+      });
+    });
+  }
+
   function clearCategoryExclusives(term, cat, mode) {
-    // For exclusive categories: remove manual and suppress detected for other terms
     if (mode !== 'exactly-one' && mode !== 'zero-or-one') return;
     const catDef = taxonomy && taxonomy.categories.find(c => c.name === cat);
     if (!catDef) return;
     catDef.terms.forEach(t => {
       if (t === term) return;
-      // Remove from manual if present
       const mIdx = currentLabels.indexOf(t);
       if (mIdx >= 0) currentLabels.splice(mIdx, 1);
-      // Suppress if detected
-      if (detectedLabels.includes(t) && !currentLabels.includes('-' + t)) {
-        currentLabels.push('-' + t);
-      }
     });
   }
 
   function bindLabelEvents(name) {
-    // Taxonomy term buttons: click to toggle
     $labelSection.querySelectorAll('.term-btn').forEach(el => {
       el.addEventListener('click', () => {
         const term = el.dataset.term;
         const mode = el.dataset.mode;
         const cat = el.dataset.cat;
         const isManual = el.classList.contains('active');
-        const isDetected = el.classList.contains('detected');
         const isSuppressed = el.classList.contains('suppressed');
 
         if (isSuppressed) {
-          // Undo suppression
           const idx = currentLabels.indexOf('-' + term);
           if (idx >= 0) currentLabels.splice(idx, 1);
         } else if (isManual) {
-          // Remove from manual (and undo any sibling suppressions we added)
           const idx = currentLabels.indexOf(term);
           if (idx >= 0) currentLabels.splice(idx, 1);
-          // Clean up suppressions of siblings that were only added because of exclusivity
-          if (mode === 'exactly-one' || mode === 'zero-or-one') {
-            const catDef = taxonomy && taxonomy.categories.find(c => c.name === cat);
-            if (catDef) {
-              catDef.terms.forEach(t => {
-                if (t === term) return;
-                const sIdx = currentLabels.indexOf('-' + t);
-                if (sIdx >= 0) currentLabels.splice(sIdx, 1);
-              });
-            }
-          }
         } else {
-          // Activate: add to manual, clear exclusives
           clearCategoryExclusives(term, cat, mode);
-          // Remove any existing suppression of this term
           const sIdx = currentLabels.indexOf('-' + term);
           if (sIdx >= 0) currentLabels.splice(sIdx, 1);
           if (!currentLabels.includes(term)) {
@@ -881,7 +1022,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         }
         saveLabels(name);
       });
-      // Right-click to suppress
       el.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         const term = el.dataset.term;
@@ -903,7 +1043,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       });
     });
 
-    // Remove buttons for extra manual labels
     $labelSection.querySelectorAll('.label-btn.remove').forEach(el => {
       el.addEventListener('click', () => {
         const idx = parseInt(el.dataset.idx);
@@ -911,7 +1050,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         saveLabels(name);
       });
     });
-    // Promote/suppress/undo for detected labels
     $labelSection.querySelectorAll('.label-btn.promote').forEach(el => {
       el.addEventListener('click', () => {
         const label = el.dataset.label;
@@ -946,7 +1084,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     $saveStatus.textContent = 'Saved';
     setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
     renderLabels(name);
-    // Update count in sidebar
     const img = images.find(i => i.name === name);
     if (img) {
       const totalCount = currentLabels.length + detectedLabels.length;
@@ -959,6 +1096,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   async function addLabel() {
     const val = $addInput.value.trim();
     if (!val) return;
+    if (isMultiSelect()) {
+      // Bulk add
+      const names = Array.from(selectedSet);
+      $saveStatus.textContent = 'Saving...';
+      await api('/api/bulk/labels', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({images: names, add: [val]}),
+      });
+      $addInput.value = '';
+      $saveStatus.textContent = 'Saved';
+      setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
+      await loadMultiLabels(names);
+      return;
+    }
     if (focusIdx < 0) return;
     const name = images[focusIdx].name;
     if (!currentLabels.includes(val)) {
@@ -966,35 +1118,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     }
     $addInput.value = '';
     await saveLabels(name);
-  }
-
-  async function bulkAction(action) {
-    const label = $bulkInput.value.trim();
-    if (!label || selectedSet.size === 0) return;
-    const payload = {images: Array.from(selectedSet)};
-    if (action === 'add') payload.add = [label];
-    else payload.remove = [label];
-
-    $saveStatus.textContent = 'Saving...';
-    await api('/api/bulk/labels', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload),
-    });
-    $bulkInput.value = '';
-    $saveStatus.textContent = 'Saved';
-    setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
-    await loadImages();
-    if (focusIdx >= 0) selectImage(focusIdx);
-  }
-
-  function updateBulkBar() {
-    if (selectedSet.size > 0) {
-      $bulkBar.style.display = 'flex';
-      $bulkCount.textContent = `${selectedSet.size} selected`;
-    } else {
-      $bulkBar.style.display = 'none';
-    }
   }
 
   function esc(s) {
@@ -1007,32 +1130,31 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   function navNext() {
     if (focusIdx < images.length - 1) {
       focusIdx++;
-      selectImage(focusIdx);
+      if (viewMode === 'list') { selectImage(focusIdx); }
       renderList();
       scrollToFocused();
     } else if (page < pages) {
       page++;
       focusIdx = 0;
-      loadImages().then(() => selectImage(0));
+      loadImages().then(() => { if (viewMode === 'list') selectImage(0); });
     }
   }
   function navPrev() {
     if (focusIdx > 0) {
       focusIdx--;
-      selectImage(focusIdx);
+      if (viewMode === 'list') { selectImage(focusIdx); }
       renderList();
       scrollToFocused();
     } else if (page > 1) {
       page--;
       loadImages().then(() => {
         focusIdx = images.length - 1;
-        selectImage(focusIdx);
+        if (viewMode === 'list') { selectImage(focusIdx); }
         renderList();
       });
     }
   }
   document.addEventListener('keydown', (e) => {
-    // Ctrl+arrow always navigates, even from inputs
     if (e.ctrlKey && (e.key === 'ArrowRight' || e.key === 'ArrowDown')) {
       e.preventDefault();
       navNext();
@@ -1043,15 +1165,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       navPrev();
       return;
     }
-    // Don't intercept other keys when typing in inputs
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
       if (e.key === 'Enter' && e.target.id === 'add-input') {
         e.preventDefault();
         addLabel();
-      }
-      if (e.key === 'Enter' && e.target.id === 'bulk-input') {
-        e.preventDefault();
-        bulkAction('add');
       }
       if (e.key === 'Escape') {
         e.target.blur();
@@ -1066,10 +1183,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       e.preventDefault();
       navPrev();
     }
-    if (e.key === ' ') {
-      e.preventDefault();
-      if (focusIdx >= 0) toggleSelect(focusIdx, e.shiftKey);
-    }
     if (e.key === 'Enter') {
       e.preventDefault();
       $addInput.focus();
@@ -1077,13 +1190,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     if (e.key === 'Escape') {
       selectedSet.clear();
       renderList();
+      if (viewMode === 'grid') onSelectionChanged();
     }
     if (e.key === 'a' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      images.forEach(img => selectedSet.add(img.name));
-      renderList();
+      if (viewMode === 'grid') {
+        images.forEach(img => selectedSet.add(img.name));
+        renderList();
+        onSelectionChanged();
+      }
     }
-    if (e.key === 'Delete' && focusIdx >= 0) {
+    if (e.key === 'Delete' && focusIdx >= 0 && !isMultiSelect()) {
       e.preventDefault();
       const name = images[focusIdx].name;
       if (confirm(`Delete ${name} and its label files?`)) {
@@ -1093,15 +1210,27 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   });
 
   function scrollToFocused() {
-    const el = $list.querySelector('.focused');
+    const el = $list.querySelector('.focused') || $list.querySelector('.selected');
     if (el) el.scrollIntoView({block: 'nearest'});
   }
+
+  // View toggle
+  document.getElementById('btn-view-toggle').addEventListener('click', () => {
+    viewMode = viewMode === 'list' ? 'grid' : 'list';
+    document.getElementById('btn-view-toggle').textContent = viewMode === 'list' ? 'Grid' : 'List';
+    selectedSet.clear();
+    if (viewMode === 'list') {
+      if (focusIdx < 0 && images.length > 0) focusIdx = 0;
+      if (focusIdx >= 0) selectImage(focusIdx);
+    } else {
+      onSelectionChanged();
+    }
+    renderList();
+  });
 
   // Event listeners
   document.getElementById('btn-prev').addEventListener('click', () => { if (page > 1) { page--; loadImages(); } });
   document.getElementById('btn-next').addEventListener('click', () => { if (page < pages) { page++; loadImages(); } });
-  document.getElementById('btn-select-all').addEventListener('click', () => { images.forEach(img => selectedSet.add(img.name)); renderList(); });
-  document.getElementById('btn-deselect').addEventListener('click', () => { selectedSet.clear(); renderList(); });
   document.getElementById('btn-refresh').addEventListener('click', async () => {
     await api('/api/refresh', {method: 'POST'});
     await loadImages();
@@ -1112,16 +1241,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     loadImages();
   });
   document.getElementById('btn-add').addEventListener('click', addLabel);
-  document.getElementById('btn-bulk-add').addEventListener('click', () => bulkAction('add'));
-  document.getElementById('btn-bulk-remove').addEventListener('click', () => bulkAction('remove'));
 
-  // Auto-save raw text fields with debounce
+  // Auto-save raw text fields with debounce (single-select only)
   let rawManualTimer = null;
   let rawDetectedTimer = null;
   $rawManual.addEventListener('input', () => {
     clearTimeout(rawManualTimer);
     rawManualTimer = setTimeout(() => {
-      if (focusIdx < 0) return;
+      if (focusIdx < 0 || isMultiSelect()) return;
       const name = images[focusIdx].name;
       const text = $rawManual.value.trim();
       currentLabels = text ? text.split(',').map(s => s.trim()).filter(Boolean) : [];
@@ -1131,7 +1258,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   $rawDetected.addEventListener('input', () => {
     clearTimeout(rawDetectedTimer);
     rawDetectedTimer = setTimeout(async () => {
-      if (focusIdx < 0) return;
+      if (focusIdx < 0 || isMultiSelect()) return;
       const name = images[focusIdx].name;
       const text = $rawDetected.value.trim();
       $saveStatus.textContent = 'Saving...';
@@ -1155,7 +1282,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     await loadImages();
     if (focusIdx >= images.length) focusIdx = Math.max(0, images.length - 1);
     if (images.length > 0) {
-      selectImage(focusIdx);
+      if (viewMode === 'list') { selectImage(focusIdx); }
       renderList();
     } else {
       $currentName.textContent = 'No image selected';
