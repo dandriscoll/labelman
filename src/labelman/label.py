@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import html as html_mod
 import io
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -212,6 +213,7 @@ def write_report(
     out.write("th { background: #f0f0f0; }\n")
     out.write(".assigned { background: #d4edda; }\n")
     out.write(".suppressed { color: #999; }\n")
+    out.write(".thumb { width: 48px; height: 48px; object-fit: cover; border-radius: 3px; vertical-align: middle; }\n")
     out.write("h2 { margin-top: 2em; }\n")
     out.write("</style>\n</head><body>\n")
 
@@ -254,8 +256,10 @@ def write_report(
         out.write("</table>\n")
 
     # --- Per-image detail ---
+    report_dir = output_path.parent.resolve()
+
     out.write("<h2>Per-Image Results</h2>\n")
-    out.write("<table>\n<tr><th>Image</th><th>Caption</th>")
+    out.write("<table>\n<tr><th></th><th>Image</th><th>Caption</th>")
     col_specs = []
     for cat in term_list.categories:
         for t in cat.terms:
@@ -264,7 +268,18 @@ def write_report(
     out.write("</tr>\n")
 
     for result in results:
-        out.write(f"<tr><td>{h(result.image)}</td>")
+        # Compute relative path from report to image
+        try:
+            rel = os.path.relpath(result.image, report_dir)
+        except ValueError:
+            rel = result.image
+        rel_escaped = h(rel)
+        img_tag = (
+            f"<img src='{rel_escaped}' class='thumb' "
+            f"onerror=\"this.style.display='none'\">"
+        )
+        out.write(f"<tr><td>{img_tag}</td>")
+        out.write(f"<td>{h(result.image)}</td>")
         out.write(f"<td>{h(labels_to_caption(result))}</td>")
         for cat_name, term_name in col_specs:
             score = result.all_scores.get(cat_name, {}).get(term_name, 0.0)
