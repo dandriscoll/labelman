@@ -8,8 +8,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
+from pathlib import Path
+
 from .integrations import run_blip, run_clip
-from .schema import TermList
+from .schema import CategoryMode, TermList
 
 
 @dataclass
@@ -30,10 +32,21 @@ class CategoryProposal:
 
 
 @dataclass
+class ImageSuggestion:
+    """Per-image suggestion data for sidecar writing."""
+    image: str
+    labels: list[str] = field(default_factory=list)
+    """Detected labels from existing categories (CLIP-detected terms / VQA answers)."""
+    mined_terms: list[str] = field(default_factory=list)
+    """Newly mined terms extracted from captions/answers."""
+
+
+@dataclass
 class SuggestResult:
     """Output of a suggest run."""
     mode: str
     proposals: list[CategoryProposal] = field(default_factory=list)
+    image_suggestions: list[ImageSuggestion] = field(default_factory=list)
 
 
 # Common stop words filtered from bootstrap captions
@@ -70,18 +83,25 @@ def _run_question(
     question: str,
     existing_terms: set[str],
     max_tokens: int | None = None,
-) -> CategoryProposal:
-    """Run a question against images and extract proposals."""
+) -> tuple[CategoryProposal, dict[str, str]]:
+    """Run a question against images and extract proposals.
+
+    Returns:
+        Tuple of (CategoryProposal, per_image_answers) where per_image_answers
+        maps image path to the VQA answer for that image.
+    """
     responses = run_blip(term_list, paths, prompt=question, max_tokens=max_tokens)
 
     # Collect raw answers
     answers: list[str] = []
     word_counts: Counter[str] = Counter()
+    per_image_answers: dict[str, str] = {}
 
     for entry in responses:
         answer = _get_answer(entry)
         if answer:
             answers.append(answer)
+            per_image_answers[entry["image"]] = answer
             words = _extract_words(answer)
             new_words = [w for w in words if w not in existing_terms]
             word_counts.update(set(new_words))
@@ -107,7 +127,32 @@ def _run_question(
         question=question,
         answers=unique_answers,
         terms=candidates,
-    )
+    ), per_image_answers
+
+
+def _detect_labels(term_list: TermList, flat_scores: dict[str, float]) -> list[str]:
+    """Detect labels for an image from flat CLIP scores using category rules."""
+    labels: list[str] = []
+    for cat in term_list.categories:
+        cat_terms = [
+            (t.term, flat_scores.get(t.term, 0.0), term_list.effective_threshold(cat, t))
+            for t in cat.terms
+        ]
+        if not cat_terms:
+            continue
+
+        if cat.mode == CategoryMode.EXACTLY_ONE:
+            best = max(cat_terms, key=lambda c: c[1])
+            labels.append(best[0])
+        elif cat.mode == CategoryMode.ZERO_OR_ONE:
+            above = [(name, score) for name, score, thresh in cat_terms if score >= thresh]
+            if above:
+                best = max(above, key=lambda c: c[1])
+                labels.append(best[0])
+        elif cat.mode == CategoryMode.ZERO_OR_MORE:
+            labels.extend(name for name, score, thresh in cat_terms if score >= thresh)
+
+    return labels
 
 
 def bootstrap(
@@ -131,16 +176,33 @@ def bootstrap(
 
     proposals = []
 
+    # Per-image tracking
+    img_suggestions: dict[str, ImageSuggestion] = {
+        p: ImageSuggestion(image=p) for p in paths
+    }
+
     # Categories with questions get targeted VQA
     for cat in term_list.categories:
         if not cat.question:
             continue
 
-        cp = _run_question(term_list, paths, cat.question, existing_terms,
-                           max_tokens=cat.question_answer_max_tokens)
+        cp, per_image = _run_question(term_list, paths, cat.question, existing_terms,
+                                      max_tokens=cat.question_answer_max_tokens)
         cp.category = cat.name
         if cp.answers or cp.terms:
             proposals.append(cp)
+        # Classify per-image answers: matching taxonomy terms → labels, rest → mined
+        cat_term_set = {t.term.lower() for t in cat.terms}
+        for img_path, answer in per_image.items():
+            if img_path not in img_suggestions:
+                continue
+            answer_words = set(_extract_words(answer))
+            matched = [t.term for t in cat.terms if t.term.lower() in answer_words
+                       or t.term.lower() == answer.strip().lower()]
+            if matched:
+                img_suggestions[img_path].labels.extend(matched)
+            else:
+                img_suggestions[img_path].mined_terms.append(answer)
 
     # Open-ended captioning for general discovery
     captions = run_blip(term_list, paths)
@@ -149,6 +211,11 @@ def bootstrap(
     for entry in captions:
         words = _extract_words(_get_answer(entry))
         word_counts.update(set(words))  # count each word once per image
+        # Track per-image mined terms
+        img = entry["image"]
+        if img in img_suggestions:
+            new_words = [w for w in words if w not in existing_terms]
+            img_suggestions[img].mined_terms.extend(new_words)
 
     min_count = 2 if len(paths) >= 4 else 1
     candidates = [
@@ -163,7 +230,11 @@ def bootstrap(
             terms=candidates,
         ))
 
-    return SuggestResult(mode="bootstrap", proposals=proposals)
+    return SuggestResult(
+        mode="bootstrap",
+        proposals=proposals,
+        image_suggestions=list(img_suggestions.values()),
+    )
 
 
 def expand(
@@ -200,16 +271,35 @@ def expand(
 
     proposals = []
 
+    # Per-image tracking — initialize with CLIP-detected labels
+    img_suggestions: dict[str, ImageSuggestion] = {}
+    for entry in clip_results:
+        image = entry["image"]
+        flat_scores = entry.get("scores", {})
+        detected = _detect_labels(term_list, flat_scores)
+        img_suggestions[image] = ImageSuggestion(image=image, labels=detected)
+
     # For categories with questions, use targeted BLIP prompts on all images
     for cat in term_list.categories:
         if not cat.question:
             continue
 
-        cp = _run_question(term_list, paths, cat.question, existing_terms,
-                           max_tokens=cat.question_answer_max_tokens)
+        cp, per_image = _run_question(term_list, paths, cat.question, existing_terms,
+                                      max_tokens=cat.question_answer_max_tokens)
         cp.category = cat.name
         if cp.answers or cp.terms:
             proposals.append(cp)
+        # Classify per-image answers: matching taxonomy terms → labels, rest → mined
+        for img_path, answer in per_image.items():
+            if img_path not in img_suggestions:
+                continue
+            answer_words = set(_extract_words(answer))
+            matched = [t.term for t in cat.terms if t.term.lower() in answer_words
+                       or t.term.lower() == answer.strip().lower()]
+            if matched:
+                img_suggestions[img_path].labels.extend(matched)
+            else:
+                img_suggestions[img_path].mined_terms.append(answer)
 
     # For weak images (no good CLIP match), use untargeted BLIP captions
     if weak_images:
@@ -220,6 +310,10 @@ def expand(
             words = _extract_words(_get_answer(entry))
             new_words = [w for w in words if w not in existing_terms]
             word_counts.update(set(new_words))
+            # Track per-image mined terms
+            img = entry["image"]
+            if img in img_suggestions:
+                img_suggestions[img].mined_terms.extend(new_words)
 
         min_count = 2 if len(weak_images) >= 4 else 1
         candidates = [
@@ -255,7 +349,11 @@ def expand(
                 terms=[Proposal(term=f"[unused: {t}]", source_count=0) for t in unused],
             ))
 
-    return SuggestResult(mode="expand", proposals=proposals)
+    return SuggestResult(
+        mode="expand",
+        proposals=proposals,
+        image_suggestions=list(img_suggestions.values()),
+    )
 
 
 def format_suggest_result(result: SuggestResult) -> str:
@@ -286,3 +384,49 @@ def format_suggest_result(result: SuggestResult) -> str:
         lines.append("")
 
     return "\n".join(lines) + "\n"
+
+
+def suggest_to_caption(
+    term_list: TermList,
+    suggestion: ImageSuggestion,
+    include_mined: bool = False,
+) -> str:
+    """Build a comma-separated caption from an ImageSuggestion.
+
+    Includes global_terms and detected labels by default.
+    When include_mined is True, also appends mined terms.
+    """
+    parts = list(term_list.global_terms) + suggestion.labels
+    if include_mined:
+        parts.extend(suggestion.mined_terms)
+
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+
+    return ", ".join(unique)
+
+
+def write_suggest_sidecar(
+    term_list: TermList,
+    suggestion: ImageSuggestion,
+    include_mined: bool = False,
+    output_dir: Path | None = None,
+) -> Path:
+    """Write a .detected.txt sidecar file with suggest results for an image.
+
+    By default writes global_terms and detected labels from existing
+    categories. When include_mined is True, also writes mined terms.
+    """
+    image_path = Path(suggestion.image)
+    if output_dir is not None:
+        sidecar = output_dir / (image_path.stem + ".detected.txt")
+    else:
+        sidecar = image_path.with_suffix(".detected.txt")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(suggest_to_caption(term_list, suggestion, include_mined))
+    return sidecar

@@ -6,11 +6,14 @@ import pytest
 
 from labelman.suggest import (
     CategoryProposal,
+    ImageSuggestion,
     Proposal,
     SuggestResult,
     bootstrap,
     expand,
     format_suggest_result,
+    suggest_to_caption,
+    write_suggest_sidecar,
     _extract_words,
 )
 from labelman.schema import parse
@@ -429,3 +432,220 @@ class TestFormatSuggestResult:
         assert "natural" in output
         assert "studio flash" in output
         assert "term: flash" in output
+
+
+CONFIG_WITH_GLOBALS = """\
+defaults:
+  threshold: 0.3
+integrations:
+  blip:
+    endpoint: http://localhost:8080/caption
+  clip:
+    endpoint: http://localhost:8081/classify
+global_terms:
+  - photo
+categories:
+  - name: subject
+    mode: exactly-one
+    terms:
+      - term: person
+      - term: animal
+"""
+
+
+class TestImageSuggestions:
+    @patch("labelman.suggest.run_blip")
+    def test_bootstrap_populates_image_suggestions(self, mock_blip):
+        mock_blip.side_effect = _mock_blip_captions([
+            "a red car parked on the street",
+            "a blue truck driving on the highway",
+        ])
+        term_list = parse(BOOTSTRAP_CONFIG)
+        result = bootstrap(term_list, ["img1.jpg", "img2.jpg"])
+
+        assert len(result.image_suggestions) == 2
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "img1.jpg" in by_image
+        assert "img2.jpg" in by_image
+        # Mined terms should be populated from captions
+        assert len(by_image["img1.jpg"].mined_terms) > 0
+
+    @patch("labelman.suggest.run_blip")
+    def test_bootstrap_vqa_unmatched_answers_go_to_mined(self, mock_blip):
+        """VQA answers that don't match existing terms go to mined_terms, not labels."""
+        mock_blip.side_effect = _mock_blip(
+            responses_by_prompt={
+                "Is this photo taken indoors or outdoors?": [
+                    {"answer": "outdoors"},
+                    {"answer": "indoors"},
+                ],
+            },
+            default_responses=[
+                {"caption": "a building with trees"},
+                {"caption": "a room with furniture"},
+            ],
+        )
+        term_list = parse(BOOTSTRAP_WITH_QUESTION)
+        result = bootstrap(term_list, ["a.jpg", "b.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        # "outdoors"/"indoors" are not in the taxonomy terms, so they go to mined
+        assert "outdoors" not in by_image["a.jpg"].labels
+        assert "outdoors" in by_image["a.jpg"].mined_terms
+        assert "indoors" in by_image["b.jpg"].mined_terms
+
+    @patch("labelman.suggest.run_blip")
+    def test_bootstrap_vqa_matching_answers_go_to_labels(self, mock_blip):
+        """VQA answers matching existing taxonomy terms go to labels."""
+        mock_blip.side_effect = _mock_blip(
+            responses_by_prompt={
+                "What type of lighting is in this image?": [
+                    {"answer": "natural light"},
+                    {"answer": "It looks like studio lighting"},
+                ],
+            },
+            default_responses=[
+                {"caption": "a photo"},
+                {"caption": "a photo"},
+            ],
+        )
+        term_list = parse(CONFIG_WITH_QUESTION)
+        result = bootstrap(term_list, ["a.jpg", "b.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        # "natural" and "studio" are terms in the lighting category
+        assert "natural" in by_image["a.jpg"].labels
+        assert "studio" in by_image["b.jpg"].labels
+
+    @patch("labelman.suggest.run_blip")
+    @patch("labelman.suggest.run_clip")
+    def test_expand_populates_clip_detected_labels(self, mock_clip, mock_blip):
+        mock_clip.side_effect = _mock_clip_scores([
+            {"person": 0.9, "animal": 0.1},
+            {"person": 0.1, "animal": 0.8},
+        ])
+        mock_blip.side_effect = _mock_blip_captions(["a photo"])
+        term_list = parse(MINIMAL_CONFIG)
+        result = expand(term_list, ["img1.jpg", "img2.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        # exactly-one: highest scoring term selected
+        assert "person" in by_image["img1.jpg"].labels
+        assert "animal" in by_image["img2.jpg"].labels
+
+    @patch("labelman.suggest.run_blip")
+    @patch("labelman.suggest.run_clip")
+    def test_expand_weak_images_get_mined_terms(self, mock_clip, mock_blip):
+        mock_clip.side_effect = _mock_clip_scores([
+            {"person": 0.1, "animal": 0.1},  # weak
+        ])
+        mock_blip.side_effect = _mock_blip_captions([
+            "a landscape with mountains and rivers",
+        ])
+        term_list = parse(MINIMAL_CONFIG)
+        result = expand(term_list, ["img1.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert len(by_image["img1.jpg"].mined_terms) > 0
+        assert "landscape" in by_image["img1.jpg"].mined_terms
+
+
+class TestSuggestToCaption:
+    def test_basic_caption(self):
+        term_list = parse(MINIMAL_CONFIG)
+        suggestion = ImageSuggestion(
+            image="img1.jpg",
+            labels=["person", "outdoors"],
+        )
+        caption = suggest_to_caption(term_list, suggestion)
+        assert caption == "person, outdoors"
+
+    def test_includes_global_terms(self):
+        term_list = parse(CONFIG_WITH_GLOBALS)
+        suggestion = ImageSuggestion(
+            image="img1.jpg",
+            labels=["person"],
+        )
+        caption = suggest_to_caption(term_list, suggestion)
+        assert caption == "photo, person"
+
+    def test_excludes_mined_by_default(self):
+        term_list = parse(MINIMAL_CONFIG)
+        suggestion = ImageSuggestion(
+            image="img1.jpg",
+            labels=["person"],
+            mined_terms=["landscape", "mountain"],
+        )
+        caption = suggest_to_caption(term_list, suggestion)
+        assert caption == "person"
+        assert "landscape" not in caption
+
+    def test_includes_mined_when_requested(self):
+        term_list = parse(MINIMAL_CONFIG)
+        suggestion = ImageSuggestion(
+            image="img1.jpg",
+            labels=["person"],
+            mined_terms=["landscape", "mountain"],
+        )
+        caption = suggest_to_caption(term_list, suggestion, include_mined=True)
+        assert caption == "person, landscape, mountain"
+
+    def test_deduplicates(self):
+        term_list = parse(CONFIG_WITH_GLOBALS)
+        suggestion = ImageSuggestion(
+            image="img1.jpg",
+            labels=["photo", "person"],
+            mined_terms=["person", "extra"],
+        )
+        caption = suggest_to_caption(term_list, suggestion, include_mined=True)
+        assert caption == "photo, person, extra"
+
+
+class TestWriteSuggestSidecar:
+    def test_writes_sidecar_next_to_image(self, tmp_path):
+        img = tmp_path / "img1.jpg"
+        img.write_text("")
+        term_list = parse(MINIMAL_CONFIG)
+        suggestion = ImageSuggestion(image=str(img), labels=["person"])
+
+        sidecar = write_suggest_sidecar(term_list, suggestion)
+        assert sidecar == tmp_path / "img1.detected.txt"
+        assert sidecar.read_text() == "person"
+
+    def test_writes_to_output_dir(self, tmp_path):
+        img = tmp_path / "images" / "img1.jpg"
+        img.parent.mkdir()
+        img.write_text("")
+        out_dir = tmp_path / "output"
+        term_list = parse(MINIMAL_CONFIG)
+        suggestion = ImageSuggestion(image=str(img), labels=["person"])
+
+        sidecar = write_suggest_sidecar(term_list, suggestion, output_dir=out_dir)
+        assert sidecar == out_dir / "img1.detected.txt"
+        assert sidecar.read_text() == "person"
+
+    def test_include_mined(self, tmp_path):
+        img = tmp_path / "img1.jpg"
+        img.write_text("")
+        term_list = parse(MINIMAL_CONFIG)
+        suggestion = ImageSuggestion(
+            image=str(img),
+            labels=["person"],
+            mined_terms=["landscape"],
+        )
+
+        sidecar = write_suggest_sidecar(term_list, suggestion, include_mined=True)
+        assert sidecar.read_text() == "person, landscape"
+
+    def test_without_mined(self, tmp_path):
+        img = tmp_path / "img1.jpg"
+        img.write_text("")
+        term_list = parse(MINIMAL_CONFIG)
+        suggestion = ImageSuggestion(
+            image=str(img),
+            labels=["person"],
+            mined_terms=["landscape"],
+        )
+
+        sidecar = write_suggest_sidecar(term_list, suggestion, include_mined=False)
+        assert sidecar.read_text() == "person"

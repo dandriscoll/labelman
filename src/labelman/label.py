@@ -116,6 +116,18 @@ def assemble_final_labels(
         else:
             additive_manual.append(label)
 
+    # Implicit suppression: in exclusive categories (exactly-one, zero-or-one),
+    # manually selecting a term displaces all other terms in that category.
+    additive_set = set(additive_manual)
+    for cat in term_list.categories:
+        if cat.mode in (CategoryMode.EXACTLY_ONE, CategoryMode.ZERO_OR_ONE):
+            cat_terms = [t.term for t in cat.terms]
+            manual_in_cat = [t for t in cat_terms if t in additive_set]
+            if manual_in_cat:
+                for t in cat_terms:
+                    if t not in additive_set:
+                        suppressions.add(t)
+
     # Merge in order: global, manual, detected — deduplicate and suppress
     merged: list[str] = []
     seen: set[str] = set()
@@ -147,19 +159,104 @@ def labels_to_caption(result: ImageLabels) -> str:
     return ", ".join(terms)
 
 
-def write_sidecar(result: ImageLabels, output_dir: Path | None = None) -> Path:
-    """Write a .txt sidecar file with comma-separated labels for an image.
+def detected_to_caption(result: ImageLabels) -> str:
+    """Convert detected category labels to a comma-separated caption.
 
-    The sidecar is placed next to the image (or in output_dir if given),
-    with the same stem and a .txt extension.
+    Only includes labels from category detection (no global terms, no manual labels).
+    """
+    terms = []
+    for cat_terms in result.labels.values():
+        terms.extend(cat_terms)
+    return ", ".join(terms)
+
+
+def write_sidecar(result: ImageLabels, output_dir: Path | None = None) -> Path:
+    """Write a .detected.txt sidecar file with detected category labels for an image.
+
+    Only writes labels from category detection (CLIP scores).
+    Global terms and manual labels are merged at apply time.
     """
     image_path = Path(result.image)
     if output_dir is not None:
-        sidecar = output_dir / (image_path.stem + ".txt")
+        sidecar = output_dir / (image_path.stem + ".detected.txt")
     else:
-        sidecar = image_path.with_suffix(".txt")
+        sidecar = image_path.with_suffix(".detected.txt")
     sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(labels_to_caption(result))
+    sidecar.write_text(detected_to_caption(result))
+    return sidecar
+
+
+def load_detected_sidecar(image_path: str) -> list[str]:
+    """Load detected labels from a .detected.txt sidecar file if it exists.
+
+    Format: comma-separated labels, whitespace-trimmed, empty entries ignored.
+    Returns an empty list if no sidecar exists.
+    """
+    p = Path(image_path)
+    sidecar = p.with_suffix(".detected.txt")
+    if not sidecar.is_file():
+        return []
+    text = sidecar.read_text().strip()
+    if not text:
+        return []
+    return [label.strip() for label in text.split(",") if label.strip()]
+
+
+def merge_sidecars(
+    term_list: TermList,
+    image_path: str,
+) -> list[str]:
+    """Merge manual (.labels.txt) and detected (.detected.txt) into final labels.
+
+    Applies the same merge logic as assemble_final_labels:
+      1. global_terms (from labelman.yaml)
+      2. additive manual labels
+      3. detected labels
+    Minus explicit suppressions (-term) and implicit exclusive-category suppressions.
+    """
+    manual_labels = load_manual_sidecar(image_path)
+    detected_labels = load_detected_sidecar(image_path)
+
+    # Separate suppression directives from additive manual labels
+    suppressions: set[str] = set()
+    additive_manual: list[str] = []
+    for label in manual_labels:
+        if label.startswith("-"):
+            suppressions.add(label[1:])
+        else:
+            additive_manual.append(label)
+
+    # Implicit suppression for exclusive categories
+    additive_set = set(additive_manual)
+    for cat in term_list.categories:
+        if cat.mode in (CategoryMode.EXACTLY_ONE, CategoryMode.ZERO_OR_ONE):
+            cat_terms = [t.term for t in cat.terms]
+            manual_in_cat = [t for t in cat_terms if t in additive_set]
+            if manual_in_cat:
+                for t in cat_terms:
+                    if t not in additive_set:
+                        suppressions.add(t)
+
+    # Merge in order: global, manual, detected — deduplicate and suppress
+    merged: list[str] = []
+    seen: set[str] = set()
+    for label in [*term_list.global_terms, *additive_manual, *detected_labels]:
+        if label not in seen and label not in suppressions:
+            merged.append(label)
+            seen.add(label)
+
+    return merged
+
+
+def write_final_sidecar(image_path: str, labels: list[str], output_dir: Path | None = None) -> Path:
+    """Write the final merged .txt sidecar for an image."""
+    p = Path(image_path)
+    if output_dir is not None:
+        sidecar = output_dir / (p.stem + ".txt")
+    else:
+        sidecar = p.with_suffix(".txt")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(", ".join(labels))
     return sidecar
 
 

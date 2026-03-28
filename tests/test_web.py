@@ -354,13 +354,13 @@ def test_delete_image(server):
 
 def test_delete_image_with_detected_sidecar(server):
     conn, dataset = server
-    (dataset / "img_003.txt").write_text("detected stuff")
+    (dataset / "img_003.detected.txt").write_text("detected stuff")
     conn.request("DELETE", "/api/images/img_003.jpg")
     resp = conn.getresponse()
     data = json.loads(resp.read())
     assert resp.status == 200
     assert not (dataset / "img_003.jpg").exists()
-    assert not (dataset / "img_003.txt").exists()
+    assert not (dataset / "img_003.detected.txt").exists()
 
 
 def test_delete_image_nonexistent(server):
@@ -460,7 +460,7 @@ def test_cli_ui_parser():
 def test_load_detected_sidecar(tmp_path):
     img = tmp_path / "photo.jpg"
     img.write_bytes(b"\xff\xd8")
-    sidecar = tmp_path / "photo.txt"
+    sidecar = tmp_path / "photo.detected.txt"
     sidecar.write_text("aircraft, mooney m20, single, calm")
     labels = load_detected_sidecar(img)
     assert labels == ["aircraft", "mooney m20", "single", "calm"]
@@ -475,14 +475,14 @@ def test_load_detected_sidecar_missing(tmp_path):
 def test_load_detected_sidecar_empty(tmp_path):
     img = tmp_path / "photo.jpg"
     img.write_bytes(b"\xff\xd8")
-    (tmp_path / "photo.txt").write_text("")
+    (tmp_path / "photo.detected.txt").write_text("")
     assert load_detected_sidecar(img) == []
 
 
 def test_index_get_detected_labels(tmp_path):
     img = tmp_path / "img.jpg"
     img.write_bytes(b"\xff\xd8")
-    (tmp_path / "img.txt").write_text("aircraft, single")
+    (tmp_path / "img.detected.txt").write_text("aircraft, single")
     index = ImageIndex(tmp_path)
     assert index.get_detected_labels("img.jpg") == ["aircraft", "single"]
 
@@ -490,7 +490,7 @@ def test_index_get_detected_labels(tmp_path):
 def test_api_labels_includes_detected(tmp_path):
     img = tmp_path / "img.jpg"
     img.write_bytes(b"\xff\xd8")
-    (tmp_path / "img.txt").write_text("aircraft, single, calm")
+    (tmp_path / "img.detected.txt").write_text("aircraft, single, calm")
     (tmp_path / "img.labels.txt").write_text("manual tag")
     srv, port = start_server_background(tmp_path)
     conn = HTTPConnection("127.0.0.1", port)
@@ -511,6 +511,107 @@ def test_suppress_label_with_minus(tmp_path):
     write_manual_sidecar(img, ["-calm", "custom tag"])
     loaded = load_manual_sidecar(str(img))
     assert loaded == ["-calm", "custom tag"]
+
+
+def test_put_labels_suppression_updates_detected_sidecar(tmp_path):
+    """When manual labels contain -term, the .detected.txt sidecar should have that term removed."""
+    # Set up dataset with detected sidecar
+    img = tmp_path / "img_000.jpg"
+    img.write_bytes(b"\xff\xd8")
+    detected = tmp_path / "img_000.detected.txt"
+    detected.write_text("red, blue, green")
+
+    srv, port = start_server_background(tmp_path)
+    conn = HTTPConnection("127.0.0.1", port)
+    try:
+        status, data = _put_json(conn, "/api/images/img_000.jpg/labels", {
+            "labels": ["-blue"]
+        })
+        assert status == 200
+        # The .txt sidecar should now have "blue" removed
+        assert detected.read_text() == "red, green"
+    finally:
+        srv.shutdown()
+        conn.close()
+
+
+def test_api_apply_single(tmp_path):
+    """POST /api/images/{name}/apply merges manual + detected → .txt"""
+    img = tmp_path / "img.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "labelman.yaml").write_text("""\
+defaults:
+  threshold: 0.3
+global_terms:
+  - aircraft
+categories:
+  - name: count
+    mode: exactly-one
+    terms:
+      - term: single
+      - term: group
+""")
+    (tmp_path / "img.detected.txt").write_text("single")
+    (tmp_path / "img.labels.txt").write_text("custom tag")
+    srv, port = start_server_background(tmp_path)
+    conn = HTTPConnection("127.0.0.1", port)
+    try:
+        status, data = _post_json(conn, "/api/images/img.jpg/apply", {})
+        assert status == 200
+        assert "aircraft" in data["final"]
+        assert "custom tag" in data["final"]
+        assert "single" in data["final"]
+        # Final .txt should be written
+        assert (tmp_path / "img.txt").read_text() == "aircraft, custom tag, single"
+    finally:
+        srv.shutdown()
+        conn.close()
+
+
+def test_api_apply_all(tmp_path):
+    """POST /api/apply-all merges all images."""
+    for name in ("a.jpg", "b.jpg"):
+        (tmp_path / name).write_bytes(b"\xff\xd8")
+    (tmp_path / "labelman.yaml").write_text("""\
+defaults:
+  threshold: 0.3
+global_terms:
+  - photo
+categories:
+  - name: subject
+    mode: exactly-one
+    terms:
+      - term: person
+""")
+    (tmp_path / "a.detected.txt").write_text("person")
+    srv, port = start_server_background(tmp_path)
+    conn = HTTPConnection("127.0.0.1", port)
+    try:
+        status, data = _post_json(conn, "/api/apply-all", {})
+        assert status == 200
+        assert data["applied"] == 2
+        # Both should have .txt sidecars
+        assert (tmp_path / "a.txt").exists()
+        assert (tmp_path / "b.txt").exists()
+        assert "photo" in (tmp_path / "a.txt").read_text()
+        assert "person" in (tmp_path / "a.txt").read_text()
+    finally:
+        srv.shutdown()
+        conn.close()
+
+
+def test_api_apply_no_config(tmp_path):
+    """Apply without labelman.yaml returns 400."""
+    img = tmp_path / "img.jpg"
+    img.write_bytes(b"\xff\xd8")
+    srv, port = start_server_background(tmp_path)
+    conn = HTTPConnection("127.0.0.1", port)
+    try:
+        status, data = _post_json(conn, "/api/images/img.jpg/apply", {})
+        assert status == 400
+    finally:
+        srv.shutdown()
+        conn.close()
 
 
 def test_cli_ui_defaults():

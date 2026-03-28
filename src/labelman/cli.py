@@ -11,9 +11,9 @@ from pathlib import Path
 
 from .check import check
 from .integrations import get_descriptor, run_clip
-from .label import assemble_final_labels, load_manual_sidecar, write_csv, write_report, write_sidecar
+from .label import assemble_final_labels, load_manual_sidecar, merge_sidecars, write_csv, write_final_sidecar, write_report, write_sidecar
 from .schema import parse
-from .suggest import bootstrap, expand, format_suggest_result
+from .suggest import bootstrap, expand, format_suggest_result, write_suggest_sidecar
 from .web import serve as web_serve
 
 
@@ -36,9 +36,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     for warn in result.warnings:
         print(f"WARNING: {warn}", file=sys.stderr)
 
-    summary = f"OK: {result.num_categories} categories, {result.num_terms} terms"
-    if result.num_global_terms:
-        summary += f", {result.num_global_terms} global terms"
+    summary = f"OK: {result.num_categories} categories, {result.num_terms} terms, {result.num_global_terms} global terms"
     print(summary)
     return 0
 
@@ -241,6 +239,20 @@ def cmd_suggest(args: argparse.Namespace) -> int:
     else:
         print(output, end="")
 
+    if args.txt:
+        output_dir = Path(args.txt_output) if args.txt_output else None
+        if output_dir:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        include_mined = args.include_mined
+        for suggestion in result.image_suggestions:
+            sidecar = write_suggest_sidecar(
+                term_list, suggestion,
+                include_mined=include_mined,
+                output_dir=output_dir,
+            )
+            print(f"  {Path(suggestion.image).name} -> {sidecar.name}")
+        print(f"Wrote {len(result.image_suggestions)} sidecar(s)")
+
     return 0
 
 
@@ -332,11 +344,11 @@ def cmd_label(args: argparse.Namespace) -> int:
         result = assemble_final_labels(term_list, image_path, scores, manual_labels=manual)
         results.append(result)
 
-        # Write per-image sidecar
+        # Write per-image detected sidecar
         sidecar = write_sidecar(result, output_dir=output_dir)
         if not quiet:
-            n_labels = len(result.final_labels)
-            print(f"  [{i}/{num_images}] {name} -> {sidecar.name} ({n_labels} labels)", flush=True)
+            n_detected = sum(len(v) for v in result.labels.values())
+            print(f"  [{i}/{num_images}] {name} -> {sidecar.name} ({n_detected} detected)", flush=True)
 
     # Write CSV
     csv_path = output_dir / "labels.csv"
@@ -348,9 +360,40 @@ def cmd_label(args: argparse.Namespace) -> int:
 
     if not quiet:
         print(f"Done: {len(results)} images labeled")
-        print(f"  Sidecars: {output_dir}/*.txt")
+        print(f"  Sidecars: {output_dir}/*.detected.txt")
         print(f"  CSV:      {csv_path}")
         print(f"  Report:   {report_path}")
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    if not config_path.is_file():
+        print(f"Error: {config_path} not found", file=sys.stderr)
+        return 1
+
+    images_path = Path(args.images)
+    if not images_path.is_dir():
+        print(f"Error: {images_path} is not a directory", file=sys.stderr)
+        return 1
+
+    image_paths = _find_images(images_path)
+    if not image_paths:
+        print(f"Error: no images found in {images_path}", file=sys.stderr)
+        return 1
+
+    term_list = parse(config_path)
+    output_dir = Path(args.output) if args.output else None
+
+    count = 0
+    for image_path in image_paths:
+        merged = merge_sidecars(term_list, image_path)
+        sidecar = write_final_sidecar(image_path, merged, output_dir=output_dir)
+        count += 1
+        name = Path(image_path).name
+        print(f"  {name} -> {sidecar.name} ({len(merged)} labels)")
+
+    print(f"Applied {count} image(s)")
     return 0
 
 
@@ -396,6 +439,12 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Number (e.g. 10) or percentage (e.g. 25%%) of images to sample")
     suggest_p.add_argument("--images", default=".", help="Directory containing images")
     suggest_p.add_argument("--output", default=None, help="Write suggestions to file (default: stdout)")
+    suggest_p.add_argument("--txt", action="store_true",
+                           help="Write per-image .txt sidecar files with suggested labels")
+    suggest_p.add_argument("--txt-output", default=None,
+                           help="Output directory for .txt sidecars (default: same as --images)")
+    suggest_p.add_argument("--include-mined", action="store_true",
+                           help="Include mined terms in .txt sidecars (default: only existing category labels)")
     suggest_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
 
     # label
@@ -405,6 +454,13 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Output directory for sidecars, CSV, and report (default: same as --images)")
     label_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
     label_p.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
+
+    # apply
+    apply_p = sub.add_parser("apply", help="Merge .labels.txt + .detected.txt into final .txt sidecars")
+    apply_p.add_argument("--images", default=".", help="Directory containing images")
+    apply_p.add_argument("--output", default=None,
+                         help="Output directory for .txt sidecars (default: same as --images)")
+    apply_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
 
     # ui
     ui_p = sub.add_parser("ui", help="Launch web-based labeling interface")
@@ -432,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
         "check": cmd_check,
         "suggest": cmd_suggest,
         "label": cmd_label,
+        "apply": cmd_apply,
         "ui": cmd_ui,
         "descriptor": cmd_descriptor,
     }

@@ -7,7 +7,9 @@ from labelman.label import (
     assemble_final_labels,
     labels_to_caption,
     load_manual_sidecar,
+    merge_sidecars,
     write_csv,
+    write_final_sidecar,
     write_report,
     write_sidecar,
 )
@@ -188,8 +190,7 @@ def test_write_sidecar(tmp_path):
     img.write_text("")  # dummy image
     result = apply_labels(tl, str(img), scores)
     sidecar = write_sidecar(result)
-    assert sidecar.suffix == ".txt"
-    assert sidecar.stem == "photo"
+    assert sidecar.name == "photo.detected.txt"
     content = sidecar.read_text()
     assert "single" in content
 
@@ -201,7 +202,7 @@ def test_write_sidecar_output_dir(tmp_path):
     out_dir = tmp_path / "labels"
     sidecar = write_sidecar(result, output_dir=out_dir)
     assert sidecar.parent == out_dir
-    assert sidecar.name == "photo.txt"
+    assert sidecar.name == "photo.detected.txt"
     assert sidecar.read_text()
 
 
@@ -338,6 +339,63 @@ def test_load_manual_sidecar_empty_file(tmp_path):
     sidecar.write_text("")
     labels = load_manual_sidecar(str(img))
     assert labels == []
+
+
+# --- Merge sidecars ---
+
+def test_merge_sidecars_detected_only(tmp_path):
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "photo.detected.txt").write_text("single, calm")
+    merged = merge_sidecars(tl, str(img))
+    # global terms + detected
+    assert merged == ["aircraft", "mooney m20", "single", "calm"]
+
+
+def test_merge_sidecars_manual_and_detected(tmp_path):
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "photo.detected.txt").write_text("single, calm")
+    (tmp_path / "photo.labels.txt").write_text("custom tag")
+    merged = merge_sidecars(tl, str(img))
+    assert merged == ["aircraft", "mooney m20", "custom tag", "single", "calm"]
+
+
+def test_merge_sidecars_suppression(tmp_path):
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "photo.detected.txt").write_text("single, calm")
+    (tmp_path / "photo.labels.txt").write_text("-calm")
+    merged = merge_sidecars(tl, str(img))
+    assert "calm" not in merged
+    assert "single" in merged
+
+
+def test_merge_sidecars_no_sidecars(tmp_path):
+    tl = _parse(TAXONOMY_WITH_GLOBALS)
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    merged = merge_sidecars(tl, str(img))
+    # Only global terms
+    assert merged == ["aircraft", "mooney m20"]
+
+
+def test_write_final_sidecar(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    sidecar = write_final_sidecar(str(img), ["aircraft", "single", "calm"])
+    assert sidecar.name == "photo.txt"
+    assert sidecar.read_text() == "aircraft, single, calm"
+
+
+def test_write_final_sidecar_output_dir(tmp_path):
+    out_dir = tmp_path / "output"
+    sidecar = write_final_sidecar("/data/images/photo.jpg", ["aircraft"], output_dir=out_dir)
+    assert sidecar == out_dir / "photo.txt"
+    assert sidecar.read_text() == "aircraft"
 
 
 # --- Final label assembly ---
@@ -502,3 +560,34 @@ def test_assemble_suppress_nonexistent_is_harmless():
     result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
     assert "-nonexistent" not in result.final_labels
     assert "single" in result.final_labels
+
+
+def test_assemble_exclusive_manual_displaces_detected():
+    """In exactly-one category, manual label displaces detected sibling."""
+    tl = _parse(TAXONOMY)
+    # Detection would pick "single" (highest score), but manual says "group"
+    scores = {"count": {"single": 0.9, "group": 0.1}}
+    manual = ["group"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "group" in result.final_labels
+    assert "single" not in result.final_labels
+
+
+def test_assemble_zero_or_one_manual_displaces_detected():
+    """In zero-or-one category, manual label displaces detected sibling."""
+    tl = _parse(TAXONOMY)
+    scores = {"setting": {"indoor": 0.6, "outdoor": 0.3}}
+    manual = ["outdoor"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "outdoor" in result.final_labels
+    assert "indoor" not in result.final_labels
+
+
+def test_assemble_zero_or_more_manual_does_not_displace():
+    """In zero-or-more category, manual label does NOT displace siblings."""
+    tl = _parse(TAXONOMY)
+    scores = {"mood": {"calm": 0.5, "energetic": 0.4, "tense": 0.1}}
+    manual = ["calm"]
+    result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
+    assert "calm" in result.final_labels
+    assert "energetic" in result.final_labels

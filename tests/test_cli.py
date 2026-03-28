@@ -194,8 +194,8 @@ def test_cli_label_produces_outputs(mock_clip, tmp_path, capsys):
     assert "Done: 2 images labeled" in captured.out
 
     # Check sidecar files
-    assert (images_dir / "img1.txt").exists()
-    assert (images_dir / "img2.txt").exists()
+    assert (images_dir / "img1.detected.txt").exists()
+    assert (images_dir / "img2.detected.txt").exists()
     # Check CSV
     assert (images_dir / "labels.csv").exists()
     # Check report
@@ -206,7 +206,7 @@ def test_cli_label_produces_outputs(mock_clip, tmp_path, capsys):
 def test_cli_label_sidecar_content(mock_clip, tmp_path):
     config_path, images_dir = _make_label_workspace(tmp_path)
     main(["label", "--images", str(images_dir), "--config", str(config_path)])
-    content = (images_dir / "img1.txt").read_text()
+    content = (images_dir / "img1.detected.txt").read_text()
     assert "person" in content
     assert "calm" in content
 
@@ -217,7 +217,7 @@ def test_cli_label_output_dir(mock_clip, tmp_path):
     out_dir = tmp_path / "output"
     main(["label", "--images", str(images_dir), "--config", str(config_path),
           "--output", str(out_dir)])
-    assert (out_dir / "img1.txt").exists()
+    assert (out_dir / "img1.detected.txt").exists()
     assert (out_dir / "labels.csv").exists()
     assert (out_dir / "report.html").exists()
 
@@ -228,8 +228,15 @@ def test_cli_label_with_manual_sidecar(mock_clip, tmp_path):
     # Create a manual label sidecar
     (images_dir / "img1.labels.txt").write_text("custom tag\n")
     main(["label", "--images", str(images_dir), "--config", str(config_path)])
-    content = (images_dir / "img1.txt").read_text()
-    assert "custom tag" in content
+    # .detected.txt should only have CLIP-detected terms, not manual labels
+    detected_content = (images_dir / "img1.detected.txt").read_text()
+    assert "custom tag" not in detected_content
+    assert "person" in detected_content
+    # After apply, .txt should have manual + detected + globals
+    main(["apply", "--images", str(images_dir), "--config", str(config_path)])
+    final_content = (images_dir / "img1.txt").read_text()
+    assert "custom tag" in final_content
+    assert "person" in final_content
 
 
 def test_cli_label_missing_config(capsys):
@@ -270,7 +277,7 @@ def test_cli_label_quiet(mock_clip, tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     # Outputs should still be written
-    assert (images_dir / "img1.txt").exists()
+    assert (images_dir / "img1.detected.txt").exists()
     assert (images_dir / "labels.csv").exists()
 
 
@@ -291,6 +298,37 @@ categories:
     assert result == 1
     captured = capsys.readouterr()
     assert "no terms" in captured.err
+
+
+def test_cli_apply(tmp_path, capsys):
+    config_path = tmp_path / "labelman.yaml"
+    config_path.write_text("""\
+defaults:
+  threshold: 0.3
+global_terms:
+  - photo
+categories:
+  - name: subject
+    mode: exactly-one
+    terms:
+      - term: person
+      - term: animal
+""")
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    (images_dir / "img1.jpg").write_text("")
+    (images_dir / "img1.detected.txt").write_text("person")
+    (images_dir / "img1.labels.txt").write_text("custom tag")
+
+    result = main(["apply", "--images", str(images_dir), "--config", str(config_path)])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Applied 1 image(s)" in captured.out
+
+    final = (images_dir / "img1.txt").read_text()
+    assert "photo" in final
+    assert "custom tag" in final
+    assert "person" in final
 
 
 def test_cli_descriptor_blip(capsys):

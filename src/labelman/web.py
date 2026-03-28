@@ -11,8 +11,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .label import load_manual_sidecar
-from .schema import ParseError, parse
+from .label import load_manual_sidecar, merge_sidecars, write_final_sidecar
+from .schema import ParseError, TermList, parse
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
 
@@ -36,6 +36,7 @@ class ImageIndex:
         self.directory = directory.resolve()
         self._images: list[str] = []
         self._taxonomy: dict | None = None
+        self._term_list: TermList | None = None
         self.refresh()
 
     def refresh(self) -> None:
@@ -43,17 +44,17 @@ class ImageIndex:
             p.name for p in self.directory.iterdir()
             if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
         )
-        self._taxonomy = self._load_taxonomy()
+        self._taxonomy, self._term_list = self._load_taxonomy()
 
-    def _load_taxonomy(self) -> dict | None:
+    def _load_taxonomy(self) -> tuple[dict | None, TermList | None]:
         """Load labelman.yaml from the dataset directory if present."""
         config_path = self.directory / "labelman.yaml"
         if not config_path.is_file():
-            return None
+            return None, None
         try:
             term_list = parse(config_path)
         except ParseError:
-            return None
+            return None, None
         categories = []
         for cat in term_list.categories:
             categories.append({
@@ -61,10 +62,11 @@ class ImageIndex:
                 "mode": cat.mode.value,
                 "terms": [t.term for t in cat.terms],
             })
-        result = {"categories": categories}
-        if term_list.global_terms:
-            result["global_terms"] = term_list.global_terms
-        return result
+        result = {"categories": categories, "global_terms": term_list.global_terms}
+        return result, term_list
+
+    def get_term_list(self) -> TermList | None:
+        return self._term_list
 
     def get_taxonomy(self) -> dict | None:
         return self._taxonomy
@@ -141,12 +143,12 @@ def write_manual_sidecar(image_path: Path, labels: list[str]) -> Path:
 
 
 def load_detected_sidecar(image_path: Path) -> list[str]:
-    """Load detected labels from a .txt sidecar (comma-separated caption format).
+    """Load detected labels from a .detected.txt sidecar (comma-separated caption format).
 
-    These are the output of 'labelman label' — the final assembled caption.
+    These are the output of 'labelman label' or 'labelman suggest --txt'.
     Returns an empty list if no sidecar exists.
     """
-    sidecar = image_path.with_suffix(".txt")
+    sidecar = image_path.with_suffix(".detected.txt")
     if not sidecar.is_file():
         return []
     text = sidecar.read_text().strip()
@@ -219,7 +221,7 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             self._handle_get_labels(name)
         elif path == "/api/taxonomy":
             taxonomy = self.index.get_taxonomy()
-            self._send_json(taxonomy if taxonomy else {"categories": []})
+            self._send_json(taxonomy if taxonomy else {"categories": [], "global_terms": []})
         else:
             self._send_error(404, "Not found")
 
@@ -255,6 +257,11 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         elif path == "/api/refresh":
             self.index.refresh()
             self._send_json({"total": self.index.total})
+        elif path.startswith("/api/images/") and path.endswith("/apply"):
+            name = unquote(path[len("/api/images/"):-len("/apply")])
+            self._handle_apply(name)
+        elif path == "/api/apply-all":
+            self._handle_apply_all()
         else:
             self._send_error(404, "Not found")
 
@@ -317,6 +324,19 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         if not self.index.set_labels(name, labels):
             self._send_error(404, "Image not found")
             return
+
+        # Apply suppressions to the .detected.txt sidecar
+        suppressions = {l[1:] for l in labels if l.startswith("-")}
+        if suppressions:
+            path = self.index.resolve_image(name)
+            if path is not None:
+                sidecar = path.with_suffix(".detected.txt")
+                if sidecar.is_file():
+                    detected = load_detected_sidecar(path)
+                    filtered = [l for l in detected if l not in suppressions]
+                    if filtered != detected:
+                        sidecar.write_text(", ".join(filtered) if filtered else "")
+
         self._send_json({"name": name, "manual_labels": labels})
 
     def _handle_delete_image(self, name: str) -> None:
@@ -326,12 +346,12 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             return
         # Remove image and associated sidecars
         manual_sidecar = path.with_suffix(".labels.txt")
-        detected_sidecar = path.with_suffix(".txt")
+        detected_sidecar = path.with_suffix(".detected.txt")
+        final_sidecar = path.with_suffix(".txt")
         path.unlink()
-        if manual_sidecar.is_file():
-            manual_sidecar.unlink()
-        if detected_sidecar.is_file():
-            detected_sidecar.unlink()
+        for sc in (manual_sidecar, detected_sidecar, final_sidecar):
+            if sc.is_file():
+                sc.unlink()
         self.index.refresh()
         self._send_json({"deleted": name, "total": self.index.total})
 
@@ -347,7 +367,7 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         if path is None:
             self._send_error(404, "Image not found")
             return
-        sidecar = path.with_suffix(".txt")
+        sidecar = path.with_suffix(".detected.txt")
         sidecar.write_text(text)
         self._send_json({"name": name, "text": text})
 
@@ -381,6 +401,34 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             results.append({"name": str(name), "manual_labels": updated})
 
         self._send_json({"updated": results})
+
+    def _handle_apply(self, name: str) -> None:
+        """Merge .labels.txt + .detected.txt → .txt for a single image."""
+        path = self.index.resolve_image(name)
+        if path is None:
+            self._send_error(404, "Image not found")
+            return
+        term_list = self.index.get_term_list()
+        if term_list is None:
+            self._send_error(400, "No labelman.yaml found")
+            return
+        merged = merge_sidecars(term_list, str(path))
+        sidecar = write_final_sidecar(str(path), merged)
+        self._send_json({"name": name, "final": merged, "path": str(sidecar)})
+
+    def _handle_apply_all(self) -> None:
+        """Merge .labels.txt + .detected.txt → .txt for all images."""
+        term_list = self.index.get_term_list()
+        if term_list is None:
+            self._send_error(400, "No labelman.yaml found")
+            return
+        results = []
+        for img_name in self.index._images:
+            path = self.index.directory / img_name
+            merged = merge_sidecars(term_list, str(path))
+            write_final_sidecar(str(path), merged)
+            results.append({"name": img_name, "label_count": len(merged)})
+        self._send_json({"applied": len(results), "results": results})
 
 
 def _get_display_host(host: str) -> str:
@@ -604,9 +652,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         </div>
         <div id="raw-section" style="display:none;padding:8px 12px;border-top:1px solid #333">
           <h4 style="font-size:11px;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin-bottom:4px">Manual (.labels.txt)</h4>
-          <textarea id="raw-manual" rows="3" style="width:100%;background:#1a1a2e;color:#4caf50;border:1px solid #444;border-radius:4px;font-size:11px;font-family:monospace;padding:4px;resize:vertical"></textarea>
-          <h4 style="font-size:11px;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin:6px 0 4px">Detected (.txt)</h4>
-          <textarea id="raw-detected" rows="2" style="width:100%;background:#1a1a2e;color:#5dade2;border:1px solid #444;border-radius:4px;font-size:11px;font-family:monospace;padding:4px;resize:vertical"></textarea>
+          <textarea id="raw-manual" rows="5" style="width:100%;background:#1a1a2e;color:#4caf50;border:1px solid #444;border-radius:4px;font-size:11px;font-family:monospace;padding:4px;resize:vertical"></textarea>
+          <h4 style="font-size:11px;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin:6px 0 4px">Detected (.detected.txt)</h4>
+          <textarea id="raw-detected" rows="4" style="width:100%;background:#1a1a2e;color:#5dade2;border:1px solid #444;border-radius:4px;font-size:11px;font-family:monospace;padding:4px;resize:vertical"></textarea>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin:6px 0 4px">
+            <h4 style="font-size:11px;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin:0">Final (.txt)</h4>
+            <div style="display:flex;gap:4px">
+              <button id="btn-apply" style="font-size:10px;padding:2px 8px;background:#1a2a1e;color:#4caf50;border:1px solid #4caf50;border-radius:3px;cursor:pointer" title="Write merged labels to .txt for this image">Apply</button>
+              <button id="btn-apply-all" style="font-size:10px;padding:2px 8px;background:#1a1a2e;color:#5dade2;border:1px solid #2980b9;border-radius:3px;cursor:pointer" title="Write merged labels to .txt for all images">Apply All</button>
+            </div>
+          </div>
+          <textarea id="raw-final" rows="4" readonly style="width:100%;background:#111;color:#ccc;border:1px solid #333;border-radius:4px;font-size:11px;font-family:monospace;padding:4px;resize:vertical;cursor:default"></textarea>
         </div>
         <div id="delete-section" style="display:none;padding:8px 12px;border-top:1px solid #333">
           <button id="btn-delete" style="width:100%;background:#8b0000;color:#e0e0e0;border:1px solid #e94560;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600">Delete Image</button>
@@ -677,6 +733,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   const $rawSection = document.getElementById('raw-section');
   const $rawManual = document.getElementById('raw-manual');
   const $rawDetected = document.getElementById('raw-detected');
+  const $rawFinal = document.getElementById('raw-final');
   const $saveStatus = document.getElementById('save-status');
   const $sidebar = document.querySelector('.sidebar');
   const $gridArea = document.getElementById('grid-area');
@@ -956,6 +1013,29 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     $labelSection.innerHTML = html;
     $rawManual.value = currentLabels.join(', ');
     $rawDetected.value = detectedLabels.join(', ');
+    // Compute final merged labels: global + manual additive + detected, minus suppressions, deduplicated
+    // Also apply implicit suppression for exclusive categories (exactly-one, zero-or-one)
+    const allSuppressions = new Set(suppressions);
+    if (taxonomy && taxonomy.categories) {
+      const additiveSet = new Set(additive);
+      taxonomy.categories.forEach(cat => {
+        if (cat.mode !== 'exactly-one' && cat.mode !== 'zero-or-one') return;
+        const manualInCat = cat.terms.filter(t => additiveSet.has(t));
+        if (manualInCat.length > 0) {
+          cat.terms.forEach(t => { if (!additiveSet.has(t)) allSuppressions.add(t); });
+        }
+      });
+    }
+    const globalTerms = (taxonomy && taxonomy.global_terms) ? taxonomy.global_terms : [];
+    const merged = [];
+    const seen = new Set();
+    for (const l of [...globalTerms, ...additive, ...detectedLabels]) {
+      if (!allSuppressions.has(l) && !seen.has(l)) {
+        seen.add(l);
+        merged.push(l);
+      }
+    }
+    $rawFinal.value = merged.join(', ');
     bindLabelEvents(name);
   }
 
@@ -1091,8 +1171,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     if (!catDef) return;
     catDef.terms.forEach(t => {
       if (t === term) return;
+      // Remove manual selection
       const mIdx = currentLabels.indexOf(t);
       if (mIdx >= 0) currentLabels.splice(mIdx, 1);
+      // Suppress detected terms that conflict with the new selection
+      if (detectedLabels.includes(t) && !currentLabels.includes('-' + t)) {
+        currentLabels.push('-' + t);
+      }
     });
   }
 
@@ -1102,19 +1187,32 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         const term = el.dataset.term;
         const mode = el.dataset.mode;
         const cat = el.dataset.cat;
-        const isManual = el.classList.contains('active');
+        const isActive = el.classList.contains('active');
         const isSuppressed = el.classList.contains('suppressed');
+        const isDetected = el.classList.contains('detected');
 
         if (isSuppressed) {
+          // Red → Blue/Grey: remove suppression (returns to detected or unset)
           const idx = currentLabels.indexOf('-' + term);
           if (idx >= 0) currentLabels.splice(idx, 1);
-        } else if (isManual) {
+        } else if (isActive) {
+          // Green → Red if detected, Grey if not: deselect (and suppress if detected)
           const idx = currentLabels.indexOf(term);
           if (idx >= 0) currentLabels.splice(idx, 1);
-        } else {
+          if (detectedLabels.includes(term)) {
+            currentLabels.push('-' + term);
+          }
+        } else if (isDetected) {
+          // Blue → Green: promote to manual
           clearCategoryExclusives(term, cat, mode);
+          if (!currentLabels.includes(term)) {
+            currentLabels.push(term);
+          }
+        } else {
+          // Grey → Green: select
           const sIdx = currentLabels.indexOf('-' + term);
           if (sIdx >= 0) currentLabels.splice(sIdx, 1);
+          clearCategoryExclusives(term, cat, mode);
           if (!currentLabels.includes(term)) {
             currentLabels.push(term);
           }
@@ -1124,16 +1222,18 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       el.addEventListener('contextmenu', (e) => {
         e.preventDefault();
         const term = el.dataset.term;
-        const isManual = el.classList.contains('active');
         const isSuppressed = el.classList.contains('suppressed');
+
         if (isSuppressed) {
+          // Red → Grey/Blue: remove explicit suppression
           const idx = currentLabels.indexOf('-' + term);
           if (idx >= 0) currentLabels.splice(idx, 1);
         } else {
-          if (isManual) {
-            const idx = currentLabels.indexOf(term);
-            if (idx >= 0) currentLabels.splice(idx, 1);
-          }
+          // Grey/Blue/Green → Red: suppress
+          // Remove manual selection if present
+          const idx = currentLabels.indexOf(term);
+          if (idx >= 0) currentLabels.splice(idx, 1);
+          // Add explicit suppression
           if (!currentLabels.includes('-' + term)) {
             currentLabels.push('-' + term);
           }
@@ -1365,6 +1465,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   document.getElementById('list-zoom').addEventListener('input', (e) => {
     const sz = parseInt(e.target.value);
     $list.style.setProperty('--list-thumb', sz + 'px');
+    try { localStorage.setItem('labelman-list-zoom', sz); } catch(e) {}
   });
 
   // Event listeners - grid toolbar
@@ -1383,6 +1484,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const sz = parseInt(e.target.value);
     $gridContainer.style.setProperty('--grid-size', sz + 'px');
     $gridContainer.style.setProperty('--thumb-height', Math.round(sz * 0.75) + 'px');
+    try { localStorage.setItem('labelman-grid-zoom', sz); } catch(e) {}
   });
 
   // Auto-save raw text fields with debounce (single-select only)
@@ -1437,9 +1539,32 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   }
   document.getElementById('btn-delete').addEventListener('click', deleteCurrentImage);
 
-  // Initial load
-  api('/api/taxonomy').then(data => { taxonomy = data; }).catch(() => {});
-  loadImages();
+  // Apply buttons
+  document.getElementById('btn-apply').addEventListener('click', async () => {
+    if (focusIdx < 0) return;
+    const name = images[focusIdx].name;
+    $saveStatus.textContent = 'Applying...';
+    await api(`/api/images/${encodeURIComponent(name)}/apply`, {method: 'POST'});
+    $saveStatus.textContent = 'Applied';
+    setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
+  });
+  document.getElementById('btn-apply-all').addEventListener('click', async () => {
+    $saveStatus.textContent = 'Applying all...';
+    const data = await api('/api/apply-all', {method: 'POST'});
+    $saveStatus.textContent = `Applied ${data.applied} image(s)`;
+    setTimeout(() => { $saveStatus.textContent = ''; }, 3000);
+  });
+
+  // Restore saved zoom levels
+  try {
+    const lz = localStorage.getItem('labelman-list-zoom');
+    if (lz) { const sz = parseInt(lz); document.getElementById('list-zoom').value = sz; $list.style.setProperty('--list-thumb', sz + 'px'); }
+    const gz = localStorage.getItem('labelman-grid-zoom');
+    if (gz) { const sz = parseInt(gz); document.getElementById('grid-zoom').value = sz; $gridContainer.style.setProperty('--grid-size', sz + 'px'); $gridContainer.style.setProperty('--thumb-height', Math.round(sz * 0.75) + 'px'); }
+  } catch(e) {}
+
+  // Initial load — taxonomy must resolve before images so renderLabels has global_terms
+  api('/api/taxonomy').then(data => { taxonomy = data; }).catch(() => {}).then(() => loadImages());
 })();
 </script>
 </body>
