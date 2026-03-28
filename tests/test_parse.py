@@ -473,3 +473,132 @@ categories:
   - name: subject
     mode: exactly-one
 """)
+
+
+def test_parse_llm_integration():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+integrations:
+  llm:
+    endpoint: http://localhost:11434/v1/chat/completions
+    model: llama3
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+    assert tl.integrations.llm is not None
+    assert tl.integrations.llm.endpoint == "http://localhost:11434/v1/chat/completions"
+    assert tl.integrations.llm.model == "llama3"
+
+
+def test_parse_llm_integration_no_model():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+integrations:
+  llm:
+    endpoint: http://localhost:11434/v1/chat/completions
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+    assert tl.integrations.llm is not None
+    assert tl.integrations.llm.model is None
+
+
+def test_parse_llm_integration_missing_endpoint():
+    with pytest.raises(ParseError, match="integrations.llm.*endpoint"):
+        parse("""\
+defaults:
+  threshold: 0.3
+integrations:
+  llm:
+    model: llama3
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+""")
+
+
+def test_parse_term_ask():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: vis
+    mode: zero-or-one
+    terms:
+      - term: front
+        ask: "Is a person visible through the front window?"
+      - term: side
+        ask: "Is a person visible through a side window?"
+""")
+    assert tl.categories[0].terms[0].ask == "Is a person visible through the front window?"
+    assert tl.categories[0].terms[1].ask == "Is a person visible through a side window?"
+
+
+def test_parse_term_ask_string_term_has_no_ask():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - plain_string
+""")
+    assert tl.categories[0].terms[0].ask is None
+
+
+def test_parse_category_ask():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: setting
+    mode: zero-or-one
+    question: "Is this indoors or outdoors?"
+    ask: "Describe the setting."
+    terms:
+      - term: indoor
+      - term: outdoor
+""")
+    assert tl.categories[0].question == "Is this indoors or outdoors?"
+    assert tl.categories[0].ask == "Describe the setting."
+
+
+def test_parse_term_ask_negative():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: prop
+    mode: zero-or-one
+    terms:
+      - term: visible
+        ask: "Is a propeller visible?"
+        ask_negative: "Is the propeller hidden?"
+""")
+    assert tl.categories[0].terms[0].ask == "Is a propeller visible?"
+    assert tl.categories[0].terms[0].ask_negative == "Is the propeller hidden?"
+
+
+def test_parse_term_no_ask_negative():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: a
+    mode: zero-or-more
+    terms:
+      - term: x
+        ask: "Is x?"
+""")
+    assert tl.categories[0].terms[0].ask_negative is None

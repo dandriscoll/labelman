@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import subprocess
 import sys
@@ -76,6 +77,11 @@ defaults:
 # script:   Path to a custom script. When set, the built-in script
 #           is bypassed and endpoint is ignored.
 #
+# llm:      Optional LLM integration (litellm-compatible) to refine
+#           BLIP VQA answers into category labels. When configured,
+#           vague BLIP answers are sent to the LLM with the category's
+#           terms as options, and the LLM picks the best match.
+#
 # Run 'labelman descriptor blip' or 'labelman descriptor clip'
 # to see the Boutiques descriptors for the built-in scripts.
 integrations:
@@ -84,6 +90,9 @@ integrations:
   clip:
     endpoint: http://localhost:8081/classify
     # script: /path/to/custom-clip.sh   # uncomment to use a custom script
+  # llm:
+  #   endpoint: http://localhost:11434/v1/chat/completions
+  #   model: qwen3
 
 # --- Categories ---
 # Each category is a labeling axis. The mode controls how many labels
@@ -106,12 +115,19 @@ categories:
 
   # zero-or-one: at most one label. If nothing scores above threshold, none is assigned.
   # threshold here overrides the global default for this category.
-  # question: optional VQA prompt for BLIP during 'suggest'
+  # question: semantic question — shown in suggest output and sent to the
+  #           LLM for classification. Also used as the BLIP VQA prompt
+  #           unless 'prompt' is set.
+  # ask:      optional override for the BLIP VQA prompt. Use a simpler
+  #           phrasing that BLIP handles well, while 'question' keeps the
+  #           nuanced intent for the LLM. If omitted, 'question' is used
+  #           for both. Can also be set per-term for yes/no probing.
   # question_answer_max_tokens: limit answer length (default: 100)
   - name: setting
     mode: zero-or-one
     threshold: 0.4
     question: "Is this photo taken indoors, outdoors, or in a studio?"
+    ask: "Describe the setting of this photo."
     question_answer_max_tokens: 10
     terms:
       - term: indoor
@@ -148,12 +164,21 @@ def _integration_error_message(e: subprocess.CalledProcessError) -> list[str]:
         6:  "Could not resolve hostname",
         7:  "Connection refused",
         22: "Server returned an HTTP error",
+        26: "Could not read a local file (check image path and permissions)",
         28: "Request timed out",
         35: "SSL/TLS connection error",
         52: "Server returned an empty response",
         55: "Failed to send request data",
         56: "Failed to receive response data",
     }
+
+    # Extract image paths from command (everything after --images)
+    images: list[str] = []
+    cmd = e.cmd or []
+    for i, arg in enumerate(cmd):
+        if arg == "--images" and i + 1 < len(cmd):
+            images = cmd[i + 1:]
+            break
 
     lines = []
     reason = curl_errors.get(e.returncode)
@@ -169,6 +194,21 @@ def _integration_error_message(e: subprocess.CalledProcessError) -> list[str]:
     if e.stderr:
         for line in e.stderr.strip().splitlines():
             lines.append(f"  {line}")
+
+    # Show last few lines of stdout — sometimes errors land here
+    if e.stdout:
+        stdout_lines = e.stdout.strip().splitlines()
+        # Show up to last 3 lines of stdout for context
+        for line in stdout_lines[-3:]:
+            lines.append(f"  [stdout] {line}")
+
+    if images:
+        lines.append(f"  Image: {images[0]}" if len(images) == 1
+                     else f"  Images ({len(images)}): {images[0]} ... {images[-1]}")
+    logger = logging.getLogger("labelman")
+    logger.debug("integration error command: %s", " ".join(cmd))
+    logger.debug("integration error stderr: %r", e.stderr)
+    logger.debug("integration error stdout (last 500 chars): %s", (e.stdout or "")[-500:])
 
     return lines
 
@@ -220,10 +260,11 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        oaat = getattr(args, 'one_at_a_time', False)
         if args.mode == "bootstrap":
-            result = bootstrap(term_list, image_paths, sample=sample)
+            result = bootstrap(term_list, image_paths, sample=sample, one_at_a_time=oaat)
         else:
-            result = expand(term_list, image_paths, sample=sample)
+            result = expand(term_list, image_paths, sample=sample, one_at_a_time=oaat)
     except subprocess.CalledProcessError as e:
         for line in _integration_error_message(e):
             print(line, file=sys.stderr)
@@ -239,7 +280,7 @@ def cmd_suggest(args: argparse.Namespace) -> int:
     else:
         print(output, end="")
 
-    if args.txt:
+    if not args.dry_run:
         output_dir = Path(args.txt_output) if args.txt_output else None
         if output_dir:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -439,13 +480,15 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Number (e.g. 10) or percentage (e.g. 25%%) of images to sample")
     suggest_p.add_argument("--images", default=".", help="Directory containing images")
     suggest_p.add_argument("--output", default=None, help="Write suggestions to file (default: stdout)")
-    suggest_p.add_argument("--txt", action="store_true",
-                           help="Write per-image .txt sidecar files with suggested labels")
+    suggest_p.add_argument("--dry-run", action="store_true",
+                           help="Print suggestions without writing .txt sidecar files")
     suggest_p.add_argument("--txt-output", default=None,
                            help="Output directory for .txt sidecars (default: same as --images)")
     suggest_p.add_argument("--include-mined", action="store_true",
                            help="Include mined terms in .txt sidecars (default: only existing category labels)")
     suggest_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
+    suggest_p.add_argument("--one-at-a-time", action="store_true",
+                           help="Send images to BLIP/CLIP one at a time (slower, but pinpoints errors)")
 
     # label
     label_p = sub.add_parser("label", help="Apply taxonomy labels to images")
@@ -477,7 +520,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+
+    # Pull --verbose/-v out of argv so it works in any position,
+    # even before the subcommand where argparse can't see it.
+    if argv is None:
+        argv = sys.argv[1:]
+    verbose = False
+    cleaned: list[str] = []
+    for arg in argv:
+        if arg in ("--verbose", "-v"):
+            verbose = True
+        else:
+            cleaned.append(arg)
+
+    args = parser.parse_args(cleaned)
+    args.verbose = verbose
+
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(name)s: %(message)s",
+            stream=sys.stderr,
+        )
 
     if args.command is None:
         parser.print_help()

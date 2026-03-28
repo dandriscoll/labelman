@@ -20,6 +20,8 @@ class CategoryMode(Enum):
 class Term:
     term: str
     threshold: Optional[float] = None
+    ask: Optional[str] = None
+    ask_negative: Optional[str] = None
 
 
 @dataclass
@@ -29,6 +31,7 @@ class Category:
     terms: list[Term]
     threshold: Optional[float] = None
     question: Optional[str] = None
+    ask: Optional[str] = None
     question_answer_max_tokens: Optional[int] = None
 
 
@@ -50,9 +53,20 @@ class IntegrationConfig:
 
 
 @dataclass
+class LLMConfig:
+    """Configuration for an LLM integration (litellm-compatible).
+
+    Used to refine BLIP VQA answers into category labels.
+    """
+    endpoint: str
+    model: Optional[str] = None
+
+
+@dataclass
 class Integrations:
     blip: Optional[IntegrationConfig] = None
     clip: Optional[IntegrationConfig] = None
+    llm: Optional[LLMConfig] = None
 
 
 @dataclass
@@ -104,6 +118,21 @@ def _parse_integration(raw: dict, name: str, errors: list[str]) -> Optional[Inte
         errors.append(f"integrations.{name}: must specify 'endpoint' or 'script'")
         return None
     return IntegrationConfig(endpoint=endpoint, script=script)
+
+
+def _parse_llm_integration(raw: dict, errors: list[str]) -> Optional[LLMConfig]:
+    if not isinstance(raw, dict):
+        errors.append("integrations.llm: must be a mapping")
+        return None
+    endpoint = raw.get("endpoint")
+    if endpoint is None or not isinstance(endpoint, str):
+        errors.append("integrations.llm: must specify 'endpoint' as a string")
+        return None
+    model = raw.get("model")
+    if model is not None and not isinstance(model, str):
+        errors.append("integrations.llm.model: must be a string")
+        model = None
+    return LLMConfig(endpoint=endpoint, model=model)
 
 
 def _load_text(source: str | Path) -> str:
@@ -164,6 +193,8 @@ def parse(source: str | Path) -> TermList:
                 integrations_obj.blip = _parse_integration(integ_raw["blip"], "blip", errors)
             if "clip" in integ_raw:
                 integrations_obj.clip = _parse_integration(integ_raw["clip"], "clip", errors)
+            if "llm" in integ_raw:
+                integrations_obj.llm = _parse_llm_integration(integ_raw["llm"], errors)
 
     # --- global_terms (optional) ---
     global_terms_list: list[str] = []
@@ -247,6 +278,17 @@ def parse(source: str | Path) -> TermList:
                     else:
                         cat_question = q_val.strip()
 
+                # ask (optional — sent to BLIP instead of question)
+                cat_ask = None
+                if "ask" in cat_raw:
+                    p_val = cat_raw["ask"]
+                    if not isinstance(p_val, str):
+                        errors.append(f"{cat_ctx}.ask: must be a string")
+                    elif not p_val.strip():
+                        errors.append(f"{cat_ctx}.ask: must not be empty")
+                    else:
+                        cat_ask = p_val.strip()
+
                 # question_answer_max_tokens (optional, only meaningful with question)
                 cat_max_tokens = None
                 if "question_answer_max_tokens" in cat_raw:
@@ -283,6 +325,8 @@ def parse(source: str | Path) -> TermList:
                             if isinstance(term_raw, str):
                                 term_name = term_raw
                                 term_threshold = None
+                                term_ask = None
+                                term_ask_negative = None
                             elif isinstance(term_raw, dict):
                                 if "term" not in term_raw:
                                     errors.append(f"{term_ctx}: missing required key 'term'")
@@ -300,6 +344,26 @@ def parse(source: str | Path) -> TermList:
                                     errors.extend(t_errors)
                                     if not t_errors:
                                         term_threshold = float(term_raw["threshold"])
+
+                                term_ask = None
+                                if "ask" in term_raw:
+                                    tp_val = term_raw["ask"]
+                                    if not isinstance(tp_val, str):
+                                        errors.append(f"{term_ctx}.ask: must be a string")
+                                    elif not tp_val.strip():
+                                        errors.append(f"{term_ctx}.ask: must not be empty")
+                                    else:
+                                        term_ask = tp_val.strip()
+
+                                term_ask_negative = None
+                                if "ask_negative" in term_raw:
+                                    tn_val = term_raw["ask_negative"]
+                                    if not isinstance(tn_val, str):
+                                        errors.append(f"{term_ctx}.ask_negative: must be a string")
+                                    elif not tn_val.strip():
+                                        errors.append(f"{term_ctx}.ask_negative: must not be empty")
+                                    else:
+                                        term_ask_negative = tn_val.strip()
                             else:
                                 errors.append(f"{term_ctx}: must be a string or mapping")
                                 continue
@@ -310,7 +374,9 @@ def parse(source: str | Path) -> TermList:
                                     f"'{cat_name or cat_ctx}'"
                                 )
                             seen_term_names.add(term_name)
-                            terms_list.append(Term(term=term_name, threshold=term_threshold))
+                            terms_list.append(Term(term=term_name, threshold=term_threshold,
+                                                   ask=term_ask,
+                                                   ask_negative=term_ask_negative))
 
                 if cat_name is not None and cat_mode is not None:
                     categories_list.append(
@@ -320,6 +386,7 @@ def parse(source: str | Path) -> TermList:
                             terms=terms_list,
                             threshold=cat_threshold,
                             question=cat_question,
+                            ask=cat_ask,
                             question_answer_max_tokens=cat_max_tokens,
                         )
                     )

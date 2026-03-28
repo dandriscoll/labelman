@@ -347,3 +347,35 @@ def test_cli_descriptor_clip(capsys):
     desc = json.loads(captured.out)
     assert desc["name"] == "labelman-clip"
     assert "inputs" in desc
+
+
+def test_cli_verbose_before_subcommand(tmp_path, capsys):
+    """--verbose works before the subcommand."""
+    f = tmp_path / "labelman.yaml"
+    f.write_text("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: a
+    mode: exactly-one
+    terms:
+      - term: x
+""")
+    result = main(["-v", "check", "--config", str(f)])
+    assert result == 0
+
+
+def test_cli_verbose_after_subcommand(tmp_path, capsys):
+    """--verbose works after the subcommand."""
+    f = tmp_path / "labelman.yaml"
+    f.write_text("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: a
+    mode: exactly-one
+    terms:
+      - term: x
+""")
+    result = main(["check", "--config", str(f), "-v"])
+    assert result == 0

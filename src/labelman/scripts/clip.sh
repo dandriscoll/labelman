@@ -72,6 +72,11 @@ for img in "${IMAGES[@]}"; do
     fi
 
     response=$(curl -s -X POST "$ENDPOINT" -F "file=@$img" -F "terms=$TERMS")
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "Error: curl failed (code $rc) on: $img" >&2
+        exit $rc
+    fi
     scores=$(echo "$response" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)['scores']))")
     python3 -c "import json; print(json.dumps({'image': $(python3 -c "import json; print(json.dumps('$img'))"), 'scores': $scores}))"
 done

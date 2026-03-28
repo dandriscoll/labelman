@@ -14,6 +14,7 @@ from labelman.suggest import (
     format_suggest_result,
     suggest_to_caption,
     write_suggest_sidecar,
+    _classify_answer,
     _extract_words,
 )
 from labelman.schema import parse
@@ -104,7 +105,7 @@ def _mock_blip(responses_by_prompt=None, default_responses=None):
         responses_by_prompt: dict mapping prompt string -> list of response dicts
         default_responses: list of response dicts when no prompt or no match
     """
-    def mock_run_blip(term_list, image_paths, prompt=None, max_tokens=None):
+    def mock_run_blip(term_list, image_paths, prompt=None, max_tokens=None, **kwargs):
         if prompt and responses_by_prompt and prompt in responses_by_prompt:
             captions = responses_by_prompt[prompt]
         elif default_responses:
@@ -131,7 +132,7 @@ def _mock_blip_captions(captions):
 
 def _mock_clip_scores(scores_per_image):
     """Create a mock run_clip that returns given scores."""
-    def mock_run_clip(term_list, image_paths):
+    def mock_run_clip(term_list, image_paths, **kwargs):
         results = []
         for i, path in enumerate(image_paths):
             scores = scores_per_image[i] if i < len(scores_per_image) else {}
@@ -310,7 +311,7 @@ class TestExpand:
             {"person": 0.9, "animal": 0.1, "natural": 0.5, "studio": 0.2},
         ])
         blip_calls = []
-        def tracking_blip(term_list, image_paths, prompt=None, max_tokens=None):
+        def tracking_blip(term_list, image_paths, prompt=None, max_tokens=None, **kwargs):
             blip_calls.append({"paths": image_paths, "prompt": prompt})
             return [{"image": p, "caption": "warm ambient lighting"} for p in image_paths]
         mock_blip.side_effect = tracking_blip
@@ -330,7 +331,7 @@ class TestExpand:
         mock_clip.side_effect = _mock_clip_scores([
             {"person": 0.9, "animal": 0.1, "natural": 0.5, "studio": 0.2},
         ])
-        mock_blip.side_effect = lambda tl, paths, prompt=None, max_tokens=None: [
+        mock_blip.side_effect = lambda tl, paths, prompt=None, max_tokens=None, **kwargs: [
             {"image": p, "caption": "warm ambient fluorescent lighting"} for p in paths
         ]
         term_list = parse(CONFIG_WITH_QUESTION)
@@ -649,3 +650,484 @@ class TestWriteSuggestSidecar:
 
         sidecar = write_suggest_sidecar(term_list, suggestion, include_mined=False)
         assert sidecar.read_text() == "person"
+
+
+CONFIG_WITH_LLM = """\
+defaults:
+  threshold: 0.3
+integrations:
+  blip:
+    endpoint: http://localhost:8080/caption
+  clip:
+    endpoint: http://localhost:8081/classify
+  llm:
+    endpoint: http://localhost:11434/v1/chat/completions
+    model: llama3
+categories:
+  - name: subject
+    mode: exactly-one
+    question: "What is the subject?"
+    terms:
+      - term: person
+      - term: animal
+  - name: lighting
+    mode: zero-or-one
+    question: "What type of lighting is in this image?"
+    terms:
+      - term: natural
+      - term: studio
+  - name: style
+    mode: zero-or-more
+    question: "What visual styles are present?"
+    terms:
+      - term: photographic
+      - term: illustration
+      - term: abstract
+"""
+
+
+class TestClassifyAnswer:
+    @patch("labelman.suggest.run_llm")
+    def test_exactly_one_returns_single_term(self, mock_llm):
+        mock_llm.return_value = "person"
+        term_list = parse(CONFIG_WITH_LLM)
+        cat = term_list.categories[0]  # subject, exactly-one
+        result = _classify_answer(term_list, "It's a human figure", cat)
+        assert result == ["person"]
+        # Check system prompt asks for single best
+        prompt = mock_llm.call_args[0][1]
+        assert "single best" in prompt
+
+    @patch("labelman.suggest.run_llm")
+    def test_zero_or_one_returns_single_term(self, mock_llm):
+        mock_llm.return_value = "natural"
+        term_list = parse(CONFIG_WITH_LLM)
+        cat = term_list.categories[1]  # lighting, zero-or-one
+        result = _classify_answer(term_list, "It looks like natural sunlight", cat)
+        assert result == ["natural"]
+        prompt = mock_llm.call_args[0][1]
+        assert "none" in prompt
+
+    @patch("labelman.suggest.run_llm")
+    def test_zero_or_one_returns_none(self, mock_llm):
+        mock_llm.return_value = "none"
+        term_list = parse(CONFIG_WITH_LLM)
+        cat = term_list.categories[1]  # lighting
+        result = _classify_answer(term_list, "can't tell the lighting", cat)
+        assert result == []
+
+    @patch("labelman.suggest.run_llm")
+    def test_zero_or_more_returns_multiple_terms(self, mock_llm):
+        mock_llm.return_value = "photographic, abstract"
+        term_list = parse(CONFIG_WITH_LLM)
+        cat = term_list.categories[2]  # style, zero-or-more
+        result = _classify_answer(term_list, "abstract photograph", cat)
+        assert result == ["photographic", "abstract"]
+        prompt = mock_llm.call_args[0][1]
+        assert "every label" in prompt.lower()
+
+    @patch("labelman.suggest.run_llm")
+    def test_zero_or_more_returns_none(self, mock_llm):
+        mock_llm.return_value = "none"
+        term_list = parse(CONFIG_WITH_LLM)
+        cat = term_list.categories[2]  # style
+        result = _classify_answer(term_list, "nothing recognizable", cat)
+        assert result == []
+
+    @patch("labelman.suggest.run_llm")
+    def test_case_insensitive_match(self, mock_llm):
+        mock_llm.return_value = "Studio"
+        term_list = parse(CONFIG_WITH_LLM)
+        cat = term_list.categories[1]
+        result = _classify_answer(term_list, "studio flash", cat)
+        assert result == ["studio"]
+
+    @patch("labelman.suggest.run_llm")
+    def test_returns_empty_on_no_match(self, mock_llm):
+        mock_llm.return_value = "fluorescent"
+        term_list = parse(CONFIG_WITH_LLM)
+        cat = term_list.categories[1]
+        result = _classify_answer(term_list, "fluorescent overhead", cat)
+        assert result == []
+
+    @patch("labelman.suggest.run_llm")
+    def test_returns_empty_on_error(self, mock_llm):
+        mock_llm.side_effect = Exception("connection refused")
+        term_list = parse(CONFIG_WITH_LLM)
+        cat = term_list.categories[1]
+        result = _classify_answer(term_list, "some light", cat)
+        assert result == []
+
+    def test_returns_empty_without_llm(self):
+        term_list = parse(MINIMAL_CONFIG)
+        cat = term_list.categories[0]
+        result = _classify_answer(term_list, "a person", cat)
+        assert result == []
+
+    def test_returns_empty_for_category_without_terms(self):
+        term_list = parse(CONFIG_WITH_LLM)
+        term_list_no_terms = parse(CONFIG_QUESTION_NO_TERMS)
+        cat = term_list_no_terms.categories[0]
+        result = _classify_answer(term_list, "natural sunlight", cat)
+        assert result == []
+
+
+class TestLLMIntegrationInBootstrap:
+    @patch("labelman.suggest.run_llm")
+    @patch("labelman.suggest.run_blip")
+    def test_llm_classifies_vague_blip_answer(self, mock_blip, mock_llm):
+        """When word matching fails, LLM classifies the answer."""
+        mock_blip.side_effect = _mock_blip(
+            responses_by_prompt={
+                "What type of lighting is in this image?": [
+                    {"answer": "It appears to be sunlight coming through a window"},
+                ],
+            },
+            default_responses=[{"caption": "a photo"}],
+        )
+        mock_llm.return_value = "natural"
+        term_list = parse(CONFIG_WITH_LLM)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "natural" in by_image["a.jpg"].labels
+
+    @patch("labelman.suggest.run_llm")
+    @patch("labelman.suggest.run_blip")
+    def test_word_match_takes_precedence_over_llm(self, mock_blip, mock_llm):
+        """Word matching is tried first; LLM is only called if no match."""
+        mock_blip.side_effect = _mock_blip(
+            responses_by_prompt={
+                "What type of lighting is in this image?": [
+                    {"answer": "natural light"},
+                ],
+            },
+            default_responses=[{"caption": "a photo"}],
+        )
+        mock_llm.return_value = "none"
+        term_list = parse(CONFIG_WITH_LLM)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "natural" in by_image["a.jpg"].labels
+        # LLM should not have been called for the lighting category
+        lighting_calls = [
+            c for c in mock_llm.call_args_list
+            if "lighting" in str(c)
+        ]
+        assert len(lighting_calls) == 0
+
+    @patch("labelman.suggest.run_llm")
+    @patch("labelman.suggest.run_blip")
+    def test_llm_failure_falls_back_to_mined(self, mock_blip, mock_llm):
+        """When LLM fails, the answer goes to mined_terms."""
+        mock_blip.side_effect = _mock_blip(
+            responses_by_prompt={
+                "What type of lighting is in this image?": [
+                    {"answer": "some weird diffused overhead thing"},
+                ],
+            },
+            default_responses=[{"caption": "a photo"}],
+        )
+        mock_llm.side_effect = Exception("timeout")
+        term_list = parse(CONFIG_WITH_LLM)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "some weird diffused overhead thing" in by_image["a.jpg"].mined_terms
+
+
+CONFIG_WITH_ASK = """\
+defaults:
+  threshold: 0.3
+integrations:
+  blip:
+    endpoint: http://localhost:8080/caption
+  llm:
+    endpoint: http://localhost:11434/v1/chat/completions
+    model: llama3
+categories:
+  - name: pilot_visibility
+    mode: zero-or-one
+    question: "Is the pilot visible through the front window or the side window?"
+    ask: "Describe what you see through the windows of the aircraft."
+    terms:
+      - term: front
+      - term: side
+"""
+
+CONFIG_WITH_TERM_ASK = """\
+defaults:
+  threshold: 0.3
+integrations:
+  blip:
+    endpoint: http://localhost:8080/caption
+categories:
+  - name: pilot_visibility
+    mode: zero-or-one
+    question: "Is the pilot visible through the front or side window?"
+    terms:
+      - term: front
+        ask: "Is a person visible through the front window?"
+      - term: side
+        ask: "Is a person visible through a side window?"
+"""
+
+
+class TestAskQuestionSplit:
+    @patch("labelman.suggest.run_llm")
+    @patch("labelman.suggest.run_blip")
+    def test_blip_gets_ask_llm_gets_question(self, mock_blip, mock_llm):
+        """BLIP receives the simple ask; LLM receives the nuanced question."""
+        blip_prompts = []
+        def tracking_blip(term_list, image_paths, prompt=None, max_tokens=None, **kwargs):
+            blip_prompts.append(prompt)
+            return [{"image": p, "answer": "a person visible through glass"} for p in image_paths]
+        mock_blip.side_effect = tracking_blip
+        mock_llm.return_value = "front"
+
+        term_list = parse(CONFIG_WITH_ASK)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        # BLIP should have received the simple ask prompt
+        assert any("Describe" in (p or "") for p in blip_prompts)
+        assert not any("front window or the side" in (p or "") for p in blip_prompts)
+
+        # LLM system prompt should contain the nuanced question
+        llm_system = mock_llm.call_args[0][1]
+        assert "front window or the side window" in llm_system
+
+        # Result should use the classified label
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "front" in by_image["a.jpg"].labels
+
+    @patch("labelman.suggest.run_blip")
+    def test_question_used_as_blip_prompt_when_no_ask(self, mock_blip):
+        """When ask is not set, question is sent to BLIP (backward compat)."""
+        blip_prompts = []
+        def tracking_blip(term_list, image_paths, prompt=None, max_tokens=None, **kwargs):
+            blip_prompts.append(prompt)
+            return [{"image": p, "answer": "natural light"} for p in image_paths]
+        mock_blip.side_effect = tracking_blip
+
+        term_list = parse(CONFIG_WITH_QUESTION)
+        bootstrap(term_list, ["a.jpg"])
+
+        assert "What type of lighting is in this image?" in blip_prompts
+
+    @patch("labelman.suggest.run_llm")
+    @patch("labelman.suggest.run_blip")
+    def test_proposal_shows_question_not_ask(self, mock_blip, mock_llm):
+        """The suggest output shows the semantic question, not the BLIP ask."""
+        mock_blip.side_effect = _mock_blip(
+            responses_by_prompt={
+                "Describe what you see through the windows of the aircraft.": [
+                    {"answer": "a person behind the front windshield"},
+                ],
+            },
+            default_responses=[{"caption": "a photo"}],
+        )
+        mock_llm.return_value = "front"
+        term_list = parse(CONFIG_WITH_ASK)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        pilot = [cp for cp in result.proposals if cp.category == "pilot_visibility"]
+        assert len(pilot) == 1
+        assert "front window or the side window" in pilot[0].question
+
+
+class TestTermAskPrompts:
+    @patch("labelman.suggest.run_blip")
+    def test_per_term_yes_no_bootstrap(self, mock_blip):
+        """Per-term ask sends separate yes/no questions to BLIP."""
+        blip_calls = []
+        def tracking_blip(term_list, image_paths, prompt=None, max_tokens=None, **kwargs):
+            blip_calls.append(prompt)
+            if prompt and "front window" in prompt:
+                return [{"image": p, "answer": "yes"} for p in image_paths]
+            elif prompt and "side window" in prompt:
+                return [{"image": p, "answer": "no"} for p in image_paths]
+            return [{"image": p, "caption": "a photo"} for p in image_paths]
+        mock_blip.side_effect = tracking_blip
+
+        term_list = parse(CONFIG_WITH_TERM_ASK)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        # Should have called BLIP once per term
+        ask_calls = [c for c in blip_calls if c and "window" in c]
+        assert len(ask_calls) == 2
+
+        # "front" should be labeled (yes), "side" should not (no)
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "front" in by_image["a.jpg"].labels
+        assert "side" not in by_image["a.jpg"].labels
+
+    @patch("labelman.suggest.run_blip")
+    def test_per_term_both_yes(self, mock_blip):
+        """zero-or-one mode picks first affirmed when both say yes."""
+        mock_blip.side_effect = lambda tl, paths, prompt=None, max_tokens=None, **kwargs: [
+            {"image": p, "answer": "yes"} for p in paths
+        ]
+
+        term_list = parse(CONFIG_WITH_TERM_ASK)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        # zero-or-one: should pick exactly one
+        pilot_labels = [l for l in by_image["a.jpg"].labels if l in ("front", "side")]
+        assert len(pilot_labels) == 1
+
+    @patch("labelman.suggest.run_blip")
+    def test_per_term_none_yes(self, mock_blip):
+        """When no term gets a yes answer, no label is assigned."""
+        mock_blip.side_effect = lambda tl, paths, prompt=None, max_tokens=None, **kwargs: [
+            {"image": p, "answer": "no"} for p in paths
+        ]
+
+        term_list = parse(CONFIG_WITH_TERM_ASK)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        pilot_labels = [l for l in by_image["a.jpg"].labels if l in ("front", "side")]
+        assert len(pilot_labels) == 0
+
+    @patch("labelman.suggest.run_blip")
+    def test_proposal_contains_classified_terms(self, mock_blip):
+        """Proposals show the classified term names, not raw BLIP answers."""
+        def answering_blip(term_list, image_paths, prompt=None, max_tokens=None, **kwargs):
+            if prompt and "front" in prompt:
+                return [{"image": p, "answer": "yes"} for p in image_paths]
+            if prompt and "side" in prompt:
+                return [{"image": p, "answer": "no"} for p in image_paths]
+            return [{"image": p, "caption": "a photo"} for p in image_paths]
+        mock_blip.side_effect = answering_blip
+
+        term_list = parse(CONFIG_WITH_TERM_ASK)
+        result = bootstrap(term_list, ["a.jpg"])
+
+        pilot = [cp for cp in result.proposals if cp.category == "pilot_visibility"]
+        assert len(pilot) == 1
+        assert "front" in pilot[0].answers
+        assert "yes" not in pilot[0].answers
+
+
+CONFIG_WITH_ASK_NEGATIVE = """\
+defaults:
+  threshold: 0.3
+integrations:
+  blip:
+    endpoint: http://localhost:8080/caption
+categories:
+  - name: propeller
+    mode: zero-or-one
+    terms:
+      - term: visible
+        ask: "Is a propeller visible?"
+        ask_negative: "Is the propeller hidden or absent?"
+"""
+
+CONFIG_MULTI_ASK_NEGATIVE = """\
+defaults:
+  threshold: 0.3
+integrations:
+  blip:
+    endpoint: http://localhost:8080/caption
+categories:
+  - name: features
+    mode: zero-or-more
+    terms:
+      - term: propeller
+        ask: "Is a propeller visible?"
+        ask_negative: "Is the propeller hidden?"
+      - term: landing gear
+        ask: "Is the landing gear visible?"
+        ask_negative: "Is the landing gear retracted?"
+"""
+
+
+class TestAskNegative:
+    @patch("labelman.suggest.run_blip")
+    def test_positive_yes_negative_no_matches(self, mock_blip):
+        """Term matches when ask=yes and ask_negative=no."""
+        def blip(tl, paths, prompt=None, max_tokens=None, **kwargs):
+            if prompt and "visible" in prompt and "hidden" not in prompt:
+                return [{"image": p, "answer": "yes"} for p in paths]
+            if prompt and "hidden" in prompt:
+                return [{"image": p, "answer": "no"} for p in paths]
+            return [{"image": p, "caption": "a photo"} for p in paths]
+        mock_blip.side_effect = blip
+
+        term_list = parse(CONFIG_WITH_ASK_NEGATIVE)
+        result = bootstrap(term_list, ["a.jpg"])
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "visible" in by_image["a.jpg"].labels
+
+    @patch("labelman.suggest.run_blip")
+    def test_both_yes_does_not_match(self, mock_blip):
+        """When both positive and negative say yes (bias), term does not match."""
+        mock_blip.side_effect = lambda tl, paths, prompt=None, max_tokens=None, **kwargs: [
+            {"image": p, "answer": "yes"} for p in paths
+        ]
+
+        term_list = parse(CONFIG_WITH_ASK_NEGATIVE)
+        result = bootstrap(term_list, ["a.jpg"])
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "visible" not in by_image["a.jpg"].labels
+
+    @patch("labelman.suggest.run_blip")
+    def test_positive_no_does_not_match(self, mock_blip):
+        """When positive says no, term does not match regardless of negative."""
+        mock_blip.side_effect = lambda tl, paths, prompt=None, max_tokens=None, **kwargs: [
+            {"image": p, "answer": "no"} for p in paths
+        ]
+
+        term_list = parse(CONFIG_WITH_ASK_NEGATIVE)
+        result = bootstrap(term_list, ["a.jpg"])
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "visible" not in by_image["a.jpg"].labels
+
+    @patch("labelman.suggest.run_blip")
+    def test_zero_or_more_with_negative(self, mock_blip):
+        """ask_negative works with zero-or-more: each term evaluated independently."""
+        def blip(tl, paths, prompt=None, max_tokens=None, **kwargs):
+            if prompt and "propeller visible" in prompt:
+                return [{"image": p, "answer": "yes"} for p in paths]
+            if prompt and "propeller hidden" in prompt:
+                return [{"image": p, "answer": "no"} for p in paths]
+            if prompt and "landing gear visible" in prompt:
+                return [{"image": p, "answer": "yes"} for p in paths]
+            if prompt and "landing gear retracted" in prompt:
+                return [{"image": p, "answer": "yes"} for p in paths]  # bias!
+            return [{"image": p, "caption": "a photo"} for p in paths]
+        mock_blip.side_effect = blip
+
+        term_list = parse(CONFIG_MULTI_ASK_NEGATIVE)
+        result = bootstrap(term_list, ["a.jpg"])
+        by_image = {s.image: s for s in result.image_suggestions}
+        # propeller: yes + not hidden → match
+        assert "propeller" in by_image["a.jpg"].labels
+        # landing gear: yes + also retracted (bias) → no match
+        assert "landing gear" not in by_image["a.jpg"].labels
+
+
+class TestLLMIntegrationInExpand:
+    @patch("labelman.suggest.run_llm")
+    @patch("labelman.suggest.run_blip")
+    @patch("labelman.suggest.run_clip")
+    def test_llm_classifies_vague_blip_answer(self, mock_clip, mock_blip, mock_llm):
+        mock_clip.side_effect = _mock_clip_scores([
+            {"person": 0.9, "animal": 0.1, "natural": 0.5, "studio": 0.2},
+        ])
+        mock_blip.side_effect = _mock_blip(
+            responses_by_prompt={
+                "What type of lighting is in this image?": [
+                    {"answer": "It's bright sunshine"},
+                ],
+            },
+        )
+        mock_llm.return_value = "natural"
+        term_list = parse(CONFIG_WITH_LLM)
+        result = expand(term_list, ["a.jpg"])
+
+        by_image = {s.image: s for s in result.image_suggestions}
+        assert "natural" in by_image["a.jpg"].labels

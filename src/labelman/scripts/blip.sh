@@ -81,6 +81,11 @@ for img in "${IMAGES[@]}"; do
     fi
 
     response=$(curl "${curl_args[@]}")
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "Error: curl failed (code $rc) on: $img" >&2
+        exit $rc
+    fi
     echo "$response" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)

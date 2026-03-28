@@ -75,12 +75,19 @@ class ImageIndex:
     def total(self) -> int:
         return len(self._images)
 
-    def list_images(self, page: int = 1, per_page: int = DEFAULT_PER_PAGE) -> tuple[list[dict], int]:
+    def list_images(self, page: int = 1, per_page: int = DEFAULT_PER_PAGE,
+                     hide_labeled: bool = False) -> tuple[list[dict], int]:
         per_page = max(1, min(per_page, 500))
         page = max(1, page)
+
+        source = self._images
+        if hide_labeled:
+            source = [n for n in source if not self._has_labels_file(n)]
+
+        total = len(source)
         start = (page - 1) * per_page
         end = start + per_page
-        names = self._images[start:end]
+        names = source[start:end]
 
         items = []
         for name in names:
@@ -91,9 +98,30 @@ class ImageIndex:
             items.append({
                 "name": name,
                 "has_labels": total_labels > 0,
+                "has_labels_file": (path.with_suffix(".labels.txt")).is_file(),
                 "label_count": total_labels,
             })
-        return items, self.total
+        return items, total
+
+    def _has_labels_file(self, name: str) -> bool:
+        return (self.directory / name).with_suffix(".labels.txt").is_file()
+
+    def find_next_unlabeled(self, after: str | None = None) -> str | None:
+        """Find next image without a .labels.txt file, starting after the given name."""
+        start = 0
+        if after:
+            try:
+                start = self._images.index(after) + 1
+            except ValueError:
+                pass
+        for name in self._images[start:]:
+            if not self._has_labels_file(name):
+                return name
+        # Wrap around
+        for name in self._images[:start]:
+            if not self._has_labels_file(name):
+                return name
+        return None
 
     def resolve_image(self, name: str) -> Path | None:
         """Resolve an image name to a safe path within the directory."""
@@ -213,6 +241,10 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             self.end_headers()
         elif path == "/api/images":
             self._handle_list_images(qs)
+        elif path == "/api/next-unlabeled":
+            after = qs.get("after", [None])[0]
+            name = self.index.find_next_unlabeled(after)
+            self._send_json({"name": name})
         elif path.startswith("/api/images/") and path.endswith("/thumb"):
             name = unquote(path[len("/api/images/"):-len("/thumb")])
             self._handle_get_thumb(name)
@@ -276,7 +308,8 @@ class LabelmanHandler(BaseHTTPRequestHandler):
     def _handle_list_images(self, qs: dict) -> None:
         page = int(qs.get("page", ["1"])[0])
         per_page = int(qs.get("per_page", [str(DEFAULT_PER_PAGE)])[0])
-        items, total = self.index.list_images(page, per_page)
+        hide_labeled = qs.get("hide_labeled", ["0"])[0] == "1"
+        items, total = self.index.list_images(page, per_page, hide_labeled=hide_labeled)
         pages = math.ceil(total / max(1, per_page))
         self._send_json({
             "images": items,
@@ -378,6 +411,7 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         images = data.get("images", [])
         add = data.get("add", [])
         remove = data.get("remove", [])
+        unsuppress = data.get("unsuppress", [])
 
         if not isinstance(images, list) or not images:
             self._send_error(400, "'images' must be a non-empty list")
@@ -389,6 +423,10 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             if current is None:
                 continue
             updated = list(current)
+            for label in unsuppress:
+                sup = '-' + str(label).strip()
+                if sup in updated:
+                    updated.remove(sup)
             for label in remove:
                 label = str(label).strip()
                 if label in updated:
@@ -543,7 +581,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .main-header .title { font-size: 14px; font-weight: 600; }
 .main-content { flex: 1; display: flex; overflow: hidden; }
 .preview { flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #111; }
-.preview img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.preview { overflow: hidden; position: relative; }
+.preview img { max-width: 100%; max-height: 100%; object-fit: contain; transform-origin: 0 0; cursor: grab; user-select: none; -webkit-user-drag: none; }
+.preview img.dragging { cursor: grabbing; }
 .preview .empty { color: #555; font-size: 14px; }
 .label-panel { width: 300px; min-width: 300px; background: #16213e; border-left: 1px solid #333; display: flex; flex-direction: column; overflow: hidden; }
 .label-panel h3 { padding: 10px 12px; font-size: 13px; border-bottom: 1px solid #333; font-weight: 600; }
@@ -593,12 +633,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     </div>
     <div class="controls">
       <button id="btn-view-toggle">Grid</button>
+      <button id="btn-next-unlabeled" title="Skip to next image without .labels.txt">Next unlabeled</button>
+      <button id="btn-hide-labeled" title="Hide images that have .labels.txt">Hide labeled</button>
       <button id="btn-refresh">Refresh</button>
       <select id="per-page">
         <option value="25">25</option>
         <option value="50" selected>50</option>
         <option value="100">100</option>
         <option value="200">200</option>
+        <option value="500">500</option>
       </select>
       <input id="list-zoom" type="range" min="24" max="120" value="40" style="width:80px;accent-color:#e94560;cursor:pointer" title="Zoom">
     </div>
@@ -623,10 +666,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
           <button id="btn-grid-list">List</button>
           <button id="btn-grid-undo" disabled title="Undo selection (Ctrl+Z)">Undo</button>
           <button id="btn-grid-redo" disabled title="Redo selection (Ctrl+Y)">Redo</button>
+          <button id="btn-grid-hide-labeled" title="Hide images that have .labels.txt">Hide labeled</button>
           <button id="btn-grid-refresh">Refresh</button>
           <select id="grid-per-page">
-            <option value="50">50</option>
-            <option value="100" selected>100</option>
+            <option value="25">25</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
             <option value="200">200</option>
             <option value="500">500</option>
           </select>
@@ -658,7 +703,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
           <div style="display:flex;align-items:center;justify-content:space-between;margin:6px 0 4px">
             <h4 style="font-size:11px;text-transform:uppercase;color:#888;letter-spacing:0.5px;margin:0">Final (.txt)</h4>
             <div style="display:flex;gap:4px">
-              <button id="btn-apply" style="font-size:10px;padding:2px 8px;background:#1a2a1e;color:#4caf50;border:1px solid #4caf50;border-radius:3px;cursor:pointer" title="Write merged labels to .txt for this image">Apply</button>
+              <button id="btn-auto-apply" style="font-size:10px;padding:2px 8px;background:#1a1a2e;color:#888;border:1px solid #444;border-radius:3px;cursor:pointer" title="Toggle: auto-write merged labels to .txt on save">Auto-apply</button>
               <button id="btn-apply-all" style="font-size:10px;padding:2px 8px;background:#1a1a2e;color:#5dade2;border:1px solid #2980b9;border-radius:3px;cursor:pointer" title="Write merged labels to .txt for all images">Apply All</button>
             </div>
           </div>
@@ -692,6 +737,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   let lastShiftIdx = -1;
   let viewMode = 'list'; // 'list' or 'grid'
   let multiLabelData = {}; // {name: {manual: [], detected: []}}
+  let hideLabeledMode = false;
+  let autoApply = false;
 
   // Selection undo/redo stacks
   let selUndoStack = [];
@@ -744,10 +791,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     return r.json();
   }
 
-  function isMultiSelect() { return viewMode === 'grid' && selectedSet.size > 1; }
+  function isMultiSelect() { return selectedSet.size > 1; }
 
+  let lastLoadedPage = null;
   async function loadImages() {
-    const data = await api(`/api/images?page=${page}&per_page=${perPage}`);
+    if (lastLoadedPage !== null && lastLoadedPage !== page) {
+      selectedSet.clear();
+      focusIdx = -1;
+    }
+    lastLoadedPage = page;
+    const data = await api(`/api/images?page=${page}&per_page=${perPage}${hideLabeledMode ? '&hide_labeled=1' : ''}`);
     images = data.images;
     total = data.total;
     pages = data.pages;
@@ -775,17 +828,34 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     $list.innerHTML = '';
     images.forEach((img, i) => {
       const el = document.createElement('div');
-      el.className = 'image-item' + (i === focusIdx ? ' focused' : '');
+      const isSel = selectedSet.has(img.name);
+      const isFocus = i === focusIdx && !isMultiSelect();
+      el.className = 'image-item' + (isFocus ? ' focused' : '') + (isSel ? ' selected' : '');
       el.innerHTML = `
         <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
         <div class="info">
           <div class="name" title="${img.name}">${img.name}</div>
           <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
         </div>`;
-      el.addEventListener('click', () => {
+      el.addEventListener('click', (e) => {
+        if (e.shiftKey && lastShiftIdx >= 0) {
+          pushSelState();
+          const start = Math.min(lastShiftIdx, i);
+          const end = Math.max(lastShiftIdx, i);
+          for (let j = start; j <= end; j++) selectedSet.add(images[j].name);
+        } else if (e.ctrlKey || e.metaKey) {
+          pushSelState();
+          if (selectedSet.has(img.name)) selectedSet.delete(img.name);
+          else selectedSet.add(img.name);
+        } else {
+          selectedSet.clear();
+          selectedSet.add(img.name);
+          focusIdx = i;
+        }
+        lastShiftIdx = i;
         focusIdx = i;
-        selectImage(i);
         renderList();
+        onSelectionChanged();
       });
       $list.appendChild(el);
     });
@@ -805,6 +875,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
           <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
         </div>`;
       el.addEventListener('click', (e) => handleGridClick(i, e));
+      el.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        focusIdx = i;
+        setViewMode('list');
+      });
       $gridContainer.appendChild(el);
     });
   }
@@ -841,6 +916,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       document.getElementById('delete-section').style.display = 'none';
     } else if (names.length === 1) {
       $currentName.textContent = names[0];
+      if (viewMode === 'list') {
+        $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(names[0])}/thumb" />`;
+        resetZoom();
+      }
       $addSection.style.display = 'block';
       $rawSection.style.display = 'block';
       document.getElementById('delete-section').style.display = 'block';
@@ -857,6 +936,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   function selectImage(idx) {
     if (idx < 0 || idx >= images.length) return;
     const img = images[idx];
+    selectedSet.clear();
+    selectedSet.add(img.name);
     $currentName.textContent = img.name;
     $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(img.name)}/thumb" />`;
     $addSection.style.display = 'block';
@@ -866,6 +947,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   }
 
   function setViewMode(mode) {
+    // Remember current focused image name before switching
+    const focusedName = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
+    // Compute absolute index of focused image across all pages
+    const oldPerPage = perPage;
+    const absIdx = focusedName ? (page - 1) * oldPerPage + focusIdx : 0;
+
     viewMode = mode;
     selectedSet.clear();
     selUndoStack = [];
@@ -876,20 +963,31 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       $preview.style.display = '';
       $gridArea.style.display = 'none';
       document.getElementById('btn-view-toggle').textContent = 'Grid';
-      if (focusIdx < 0 && images.length > 0) focusIdx = 0;
-      perPage = parseInt(document.getElementById('per-page').value);
-      page = 1;
-      loadImages();
     } else {
       $sidebar.style.display = 'none';
       $preview.style.display = 'none';
       $gridArea.style.display = '';
       document.getElementById('btn-view-toggle').textContent = 'Grid';
-      perPage = parseInt(document.getElementById('grid-per-page').value);
-      page = 1;
-      loadImages();
-      onSelectionChanged();
     }
+    // Keep perPage stable across view switches for consistent paging
+
+    // Compute page that contains the focused image under the new perPage
+    page = Math.floor(absIdx / perPage) + 1;
+    focusIdx = absIdx % perPage;
+    lastLoadedPage = page; // prevent loadImages from clearing focus
+
+    loadImages().then(() => {
+      if (viewMode === 'list') {
+        if (focusIdx >= 0 && focusIdx < images.length) {
+          selectImage(focusIdx);
+          renderList();
+          scrollToFocused();
+        }
+      } else {
+        if (focusedName) selectedSet.add(focusedName);
+        onSelectionChanged();
+      }
+    });
   }
 
   async function loadLabels(name) {
@@ -1069,6 +1167,21 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const taxonomyTerms = new Set();
     let html = '';
 
+    // Count per-image implicit suppression for exclusive categories
+    function countImplicitSuppressed(term, cat) {
+      if (cat.mode !== 'exactly-one' && cat.mode !== 'zero-or-one') return 0;
+      let count = 0;
+      for (const name of names) {
+        const d = multiLabelData[name];
+        if (!d) continue;
+        const additive = d.manual.filter(l => !l.startsWith('-'));
+        // Does this image have a manual selection for a sibling term?
+        const hasSiblingManual = cat.terms.some(t => t !== term && additive.includes(t));
+        if (hasSiblingManual) count++;
+      }
+      return count;
+    }
+
     if (taxonomy && taxonomy.categories && taxonomy.categories.length > 0) {
       taxonomy.categories.forEach(cat => {
         const modeLabel = cat.mode === 'exactly-one' ? 'pick one' : cat.mode === 'zero-or-one' ? 'optional, pick one' : 'any';
@@ -1076,13 +1189,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         cat.terms.forEach(term => {
           taxonomyTerms.add(term);
           const c = countTerm(term);
+          const implicitSuppressed = countImplicitSuppressed(term, cat);
+          const totalSuppressed = c.suppressed + implicitSuppressed;
           let cls = 'term-btn';
           let badge = '';
           if (c.manual === n) cls += ' active';
           else if (c.manual > 0) { cls += ' partial'; badge = ` <span style="font-size:9px;opacity:0.7">${c.manual}/${n}</span>`; }
-          else if (c.detected > 0) { cls += ' detected'; badge = c.detected < n ? ` <span style="font-size:9px;opacity:0.7">${c.detected}/${n}</span>` : ''; }
-          if (c.suppressed === n) cls = 'term-btn suppressed';
-          else if (c.suppressed > 0 && c.manual === 0 && c.detected === 0) { cls = 'term-btn suppressed'; badge = ` <span style="font-size:9px;opacity:0.7">${c.suppressed}/${n}</span>`; }
+          else if (c.detected > 0 && totalSuppressed === 0) { cls += ' detected'; badge = c.detected < n ? ` <span style="font-size:9px;opacity:0.7">${c.detected}/${n}</span>` : ''; }
+          if (c.manual === 0 && totalSuppressed === n) cls = 'term-btn suppressed';
+          else if (c.manual === 0 && totalSuppressed > 0 && c.detected === 0) { cls = 'term-btn suppressed'; badge = ` <span style="font-size:9px;opacity:0.7">${totalSuppressed}/${n}</span>`; }
           html += `<button class="${cls}" data-term="${esc(term)}" data-cat="${esc(cat.name)}" data-mode="${cat.mode}">${esc(term)}${badge}</button>`;
         });
         html += '</div></div>';
@@ -1120,19 +1235,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         const term = el.dataset.term;
         const mode = el.dataset.mode;
         const cat = el.dataset.cat;
-        const isAll = el.classList.contains('active');
+        const isActive = el.classList.contains('active');
+        const isSuppressed = el.classList.contains('suppressed');
+        const isExclusive = mode === 'exactly-one' || mode === 'zero-or-one';
         $saveStatus.textContent = 'Saving...';
-        if (isAll) {
-          // Remove from all
-          await api('/api/bulk/labels', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({images: names, remove: [term]}),
-          });
-        } else {
-          // Add to all; for exclusive categories, remove siblings first
-          const payload = {images: names, add: [term]};
-          if (mode === 'exactly-one' || mode === 'zero-or-one') {
+
+        async function bulkAssert() {
+          const payload = {images: names, add: [term], unsuppress: [term]};
+          if (isExclusive) {
             const catDef = taxonomy && taxonomy.categories.find(c => c.name === cat);
             if (catDef) {
               payload.remove = catDef.terms.filter(t => t !== term);
@@ -1144,6 +1254,35 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
             body: JSON.stringify(payload),
           });
         }
+        async function bulkSuppress() {
+          await api('/api/bulk/labels', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({images: names, remove: [term], add: ['-' + term]}),
+          });
+        }
+        async function bulkRestore() {
+          await api('/api/bulk/labels', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({images: names, remove: [term], unsuppress: [term]}),
+          });
+        }
+
+        // Tri-state rotation:
+        //   Not selected (grey/blue/partial/red) → Assert (green)
+        //   Active (green) → Suppress (red)
+        //   Suppressed (red) + exclusive → Assert (green, siblings go red)
+        //   Suppressed (red) + non-exclusive → Restore (back to detected/grey)
+        if (isActive) {
+          await bulkSuppress();
+        } else if (isSuppressed && !isExclusive) {
+          await bulkRestore();
+        } else {
+          // grey, blue, partial, or suppressed+exclusive → assert
+          await bulkAssert();
+        }
+
         $saveStatus.textContent = 'Saved';
         setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
         await loadMultiLabels(names);
@@ -1188,34 +1327,50 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         const mode = el.dataset.mode;
         const cat = el.dataset.cat;
         const isActive = el.classList.contains('active');
-        const isSuppressed = el.classList.contains('suppressed');
+        const visualSuppressed = el.classList.contains('suppressed');
+        const isExplicitlySuppressed = currentLabels.includes('-' + term);
+        const isSuppressed = visualSuppressed && isExplicitlySuppressed;
+        const isImplicitlySuppressed = visualSuppressed && !isExplicitlySuppressed;
         const isDetected = el.classList.contains('detected');
+        const isExclusive = mode === 'exactly-one' || mode === 'zero-or-one';
+        const wasDetected = detectedLabels.includes(term);
 
-        if (isSuppressed) {
-          // Red → Blue/Grey: remove suppression (returns to detected or unset)
-          const idx = currentLabels.indexOf('-' + term);
-          if (idx >= 0) currentLabels.splice(idx, 1);
-        } else if (isActive) {
-          // Green → Red if detected, Grey if not: deselect (and suppress if detected)
-          const idx = currentLabels.indexOf(term);
-          if (idx >= 0) currentLabels.splice(idx, 1);
-          if (detectedLabels.includes(term)) {
-            currentLabels.push('-' + term);
-          }
-        } else if (isDetected) {
-          // Blue → Green: promote to manual
-          clearCategoryExclusives(term, cat, mode);
-          if (!currentLabels.includes(term)) {
-            currentLabels.push(term);
-          }
-        } else {
-          // Grey → Green: select
+        function doAssert() {
           const sIdx = currentLabels.indexOf('-' + term);
           if (sIdx >= 0) currentLabels.splice(sIdx, 1);
           clearCategoryExclusives(term, cat, mode);
-          if (!currentLabels.includes(term)) {
-            currentLabels.push(term);
-          }
+          if (!currentLabels.includes(term)) currentLabels.push(term);
+        }
+        function doSuppress() {
+          const idx = currentLabels.indexOf(term);
+          if (idx >= 0) currentLabels.splice(idx, 1);
+          if (!currentLabels.includes('-' + term)) currentLabels.push('-' + term);
+        }
+        function doRestore() {
+          const idx = currentLabels.indexOf(term);
+          if (idx >= 0) currentLabels.splice(idx, 1);
+          const sIdx = currentLabels.indexOf('-' + term);
+          if (sIdx >= 0) currentLabels.splice(sIdx, 1);
+        }
+
+        // Tri-state rotation — single-select is always correction-first:
+        //   Blue (any mode): Blue → Red → Green → Blue
+        //   Grey (any mode): Grey → Green → Red → Grey
+        //   Implicitly suppressed: treated as grey (assert)
+        if (isImplicitlySuppressed) {
+          doAssert();           // Implicit red → Green (same as grey)
+        } else if (isDetected) {
+          doSuppress();         // Blue → Red
+        } else if (isActive && wasDetected) {
+          doRestore();          // Green → Blue
+        } else if (isActive) {
+          doSuppress();         // Green → Red (grey cycle)
+        } else if (isSuppressed && wasDetected) {
+          doAssert();           // Red → Green
+        } else if (isSuppressed) {
+          doRestore();          // Red → Grey (grey cycle)
+        } else {
+          doAssert();           // Grey → Green
         }
         saveLabels(name);
       });
@@ -1280,7 +1435,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({labels: currentLabels}),
     });
-    $saveStatus.textContent = 'Saved';
+    if (autoApply) {
+      await api(`/api/images/${encodeURIComponent(name)}/apply`, {method: 'POST'});
+    }
+    $saveStatus.textContent = autoApply ? 'Saved + Applied' : 'Saved';
     setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
     renderLabels(name);
     const img = images.find(i => i.name === name);
@@ -1450,14 +1608,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   document.getElementById('btn-grid-redo').addEventListener('click', selRedo);
 
   // Event listeners - sidebar (list mode)
-  document.getElementById('btn-prev').addEventListener('click', () => { if (page > 1) { page--; loadImages(); } });
-  document.getElementById('btn-next').addEventListener('click', () => { if (page < pages) { page++; loadImages(); } });
+  document.getElementById('btn-prev').addEventListener('click', () => { if (page > 1) { page--; selectedSet.clear(); focusIdx = -1; loadImages(); } });
+  document.getElementById('btn-next').addEventListener('click', () => { if (page < pages) { page++; selectedSet.clear(); focusIdx = -1; loadImages(); } });
   document.getElementById('btn-refresh').addEventListener('click', async () => {
     await api('/api/refresh', {method: 'POST'});
     await loadImages();
   });
   document.getElementById('per-page').addEventListener('change', (e) => {
     perPage = parseInt(e.target.value);
+    document.getElementById('grid-per-page').value = e.target.value;
     page = 1;
     loadImages();
   });
@@ -1469,14 +1628,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   });
 
   // Event listeners - grid toolbar
-  document.getElementById('btn-grid-prev').addEventListener('click', () => { if (page > 1) { page--; loadImages(); } });
-  document.getElementById('btn-grid-next').addEventListener('click', () => { if (page < pages) { page++; loadImages(); } });
+  document.getElementById('btn-grid-prev').addEventListener('click', () => { if (page > 1) { page--; selectedSet.clear(); loadImages(); onSelectionChanged(); } });
+  document.getElementById('btn-grid-next').addEventListener('click', () => { if (page < pages) { page++; selectedSet.clear(); loadImages(); onSelectionChanged(); } });
   document.getElementById('btn-grid-refresh').addEventListener('click', async () => {
     await api('/api/refresh', {method: 'POST'});
     await loadImages();
   });
   document.getElementById('grid-per-page').addEventListener('change', (e) => {
     perPage = parseInt(e.target.value);
+    document.getElementById('per-page').value = e.target.value;
     page = 1;
     loadImages();
   });
@@ -1539,15 +1699,94 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   }
   document.getElementById('btn-delete').addEventListener('click', deleteCurrentImage);
 
-  // Apply buttons
-  document.getElementById('btn-apply').addEventListener('click', async () => {
-    if (focusIdx < 0) return;
-    const name = images[focusIdx].name;
-    $saveStatus.textContent = 'Applying...';
-    await api(`/api/images/${encodeURIComponent(name)}/apply`, {method: 'POST'});
-    $saveStatus.textContent = 'Applied';
-    setTimeout(() => { $saveStatus.textContent = ''; }, 1500);
+  // Auto-apply toggle
+  const $autoApplyBtn = document.getElementById('btn-auto-apply');
+  function updateAutoApplyBtn() {
+    if (autoApply) {
+      $autoApplyBtn.style.background = '#1e2a1e';
+      $autoApplyBtn.style.color = '#4caf50';
+      $autoApplyBtn.style.borderColor = '#4caf50';
+    } else {
+      $autoApplyBtn.style.background = '#1a1a2e';
+      $autoApplyBtn.style.color = '#888';
+      $autoApplyBtn.style.borderColor = '#444';
+    }
+  }
+  $autoApplyBtn.addEventListener('click', () => {
+    autoApply = !autoApply;
+    updateAutoApplyBtn();
+    try { localStorage.setItem('labelman-auto-apply', autoApply ? '1' : '0'); } catch(e) {}
   });
+  try {
+    autoApply = localStorage.getItem('labelman-auto-apply') === '1';
+    updateAutoApplyBtn();
+  } catch(e) {}
+
+  // Next unlabeled button
+  document.getElementById('btn-next-unlabeled').addEventListener('click', async () => {
+    const after = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
+    const data = await api(`/api/next-unlabeled${after ? '?after=' + encodeURIComponent(after) : ''}`);
+    if (!data.name) { $saveStatus.textContent = 'All images labeled'; setTimeout(() => { $saveStatus.textContent = ''; }, 2000); return; }
+    // Find page and index for this image
+    // Refresh to find the image in the full list
+    const allData = await api(`/api/images?page=1&per_page=${total || 9999}`);
+    const idx = allData.images.findIndex(i => i.name === data.name);
+    if (idx < 0) return;
+    const targetPage = Math.floor(idx / perPage) + 1;
+    if (targetPage !== page) { page = targetPage; await loadImages(); }
+    const localIdx = idx % perPage;
+    focusIdx = localIdx;
+    selectImage(focusIdx);
+    renderList();
+    scrollToFocused();
+  });
+
+  // Hide labeled toggle
+  const $hideLabeledBtn = document.getElementById('btn-hide-labeled');
+  const $gridHideLabeledBtn = document.getElementById('btn-grid-hide-labeled');
+  function updateHideLabeledBtn() {
+    $hideLabeledBtn.classList.toggle('active', hideLabeledMode);
+    $gridHideLabeledBtn.classList.toggle('active', hideLabeledMode);
+  }
+  async function toggleHideLabeled() {
+    const focusedName = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
+    hideLabeledMode = !hideLabeledMode;
+    updateHideLabeledBtn();
+    selectedSet.clear();
+
+    if (focusedName && !hideLabeledMode) {
+      // Untoggling: find the focused image in the full unfiltered list
+      const allData = await api(`/api/images?page=1&per_page=${total || 9999}`);
+      const absIdx = allData.images.findIndex(i => i.name === focusedName);
+      if (absIdx >= 0) {
+        page = Math.floor(absIdx / perPage) + 1;
+        focusIdx = absIdx % perPage;
+      } else {
+        page = 1;
+        focusIdx = 0;
+      }
+    } else {
+      page = 1;
+      focusIdx = -1;
+    }
+
+    await loadImages();
+    if (viewMode === 'list' && focusIdx >= 0 && focusIdx < images.length) {
+      selectImage(focusIdx);
+      renderList();
+      scrollToFocused();
+    }
+    if (viewMode === 'grid') onSelectionChanged();
+    try { localStorage.setItem('labelman-hide-labeled', hideLabeledMode ? '1' : '0'); } catch(e) {}
+  }
+  $hideLabeledBtn.addEventListener('click', toggleHideLabeled);
+  $gridHideLabeledBtn.addEventListener('click', toggleHideLabeled);
+  try {
+    hideLabeledMode = localStorage.getItem('labelman-hide-labeled') === '1';
+    updateHideLabeledBtn();
+  } catch(e) {}
+
+  // Apply all button
   document.getElementById('btn-apply-all').addEventListener('click', async () => {
     $saveStatus.textContent = 'Applying all...';
     const data = await api('/api/apply-all', {method: 'POST'});
@@ -1562,6 +1801,61 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const gz = localStorage.getItem('labelman-grid-zoom');
     if (gz) { const sz = parseInt(gz); document.getElementById('grid-zoom').value = sz; $gridContainer.style.setProperty('--grid-size', sz + 'px'); $gridContainer.style.setProperty('--thumb-height', Math.round(sz * 0.75) + 'px'); }
   } catch(e) {}
+
+  // Zoom/pan on preview image
+  let zoomLevel = 1, panX = 0, panY = 0, isPanning = false, panStartX = 0, panStartY = 0;
+  function resetZoom() { zoomLevel = 1; panX = 0; panY = 0; applyZoom(); }
+  function applyZoom() {
+    const img = $preview.querySelector('img');
+    if (!img) return;
+    img.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`;
+  }
+  $preview.addEventListener('wheel', (e) => {
+    const img = $preview.querySelector('img');
+    if (!img) return;
+    e.preventDefault();
+    const rect = $preview.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const oldZoom = zoomLevel;
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    zoomLevel = Math.max(0.5, Math.min(20, zoomLevel * delta));
+    // Zoom toward cursor
+    panX = mx - (mx - panX) * (zoomLevel / oldZoom);
+    panY = my - (my - panY) * (zoomLevel / oldZoom);
+    applyZoom();
+  }, {passive: false});
+  $preview.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    const img = $preview.querySelector('img');
+    if (!img) return;
+    isPanning = true;
+    panStartX = e.clientX - panX;
+    panStartY = e.clientY - panY;
+    img.classList.add('dragging');
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!isPanning) return;
+    panX = e.clientX - panStartX;
+    panY = e.clientY - panStartY;
+    applyZoom();
+  });
+  window.addEventListener('mouseup', () => {
+    if (!isPanning) return;
+    isPanning = false;
+    const img = $preview.querySelector('img');
+    if (img) img.classList.remove('dragging');
+  });
+  $preview.addEventListener('dblclick', () => resetZoom());
+
+  // Reset zoom when switching images
+  const origSelectImage = selectImage;
+  selectImage = function(idx) {
+    resetZoom();
+    origSelectImage(idx);
+  };
+
+  // Grid double-click handlers are bound per-element in renderGrid()
 
   // Initial load — taxonomy must resolve before images so renderLabels has global_terms
   api('/api/taxonomy').then(data => { taxonomy = data; }).catch(() => {}).then(() => loadImages());

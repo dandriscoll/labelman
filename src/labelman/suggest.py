@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import re
 from collections import Counter
@@ -10,8 +11,10 @@ from typing import Optional
 
 from pathlib import Path
 
-from .integrations import run_blip, run_clip
-from .schema import CategoryMode, TermList
+from .integrations import run_blip, run_clip, run_llm
+from .schema import Category, CategoryMode, TermList
+
+logger = logging.getLogger("labelman")
 
 
 @dataclass
@@ -58,6 +61,18 @@ _STOP_WORDS = frozenset(
 )
 
 
+def _dedupe(items: list[str]) -> list[str]:
+    """Deduplicate a list of strings, preserving order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        key = item.strip().lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(item.strip())
+    return result
+
+
 def _extract_words(caption: str) -> list[str]:
     """Extract meaningful words from a caption, filtering stop words."""
     words = re.findall(r"[a-z]+", caption.lower())
@@ -77,12 +92,183 @@ def _get_answer(entry: dict) -> str:
     return text.strip()
 
 
+_MODE_INSTRUCTIONS = {
+    CategoryMode.EXACTLY_ONE: (
+        "Pick the single best matching label. Output only that label, nothing else."
+    ),
+    CategoryMode.ZERO_OR_ONE: (
+        "Pick the single best matching label. "
+        "If none of the labels apply, output none. "
+        "Output only the label (or none), nothing else."
+    ),
+    CategoryMode.ZERO_OR_MORE: (
+        "Pick every label that applies. "
+        "If multiple labels apply, output them separated by commas. "
+        "If none of the labels apply, output none. "
+        "Output only labels (or none), nothing else."
+    ),
+}
+
+
+def _classify_answer(
+    term_list: TermList,
+    answer: str,
+    category: Category,
+) -> list[str]:
+    """Classify a BLIP VQA answer into category terms using the LLM.
+
+    The system prompt varies by category mode:
+      - exactly-one:  pick one label
+      - zero-or-one:  pick one label or "none"
+      - zero-or-more: pick all that apply, or "none"
+
+    Returns a list of matched term strings (may be empty).
+    """
+    llm_config = term_list.integrations.llm
+    if llm_config is None:
+        return []
+
+    term_names = [t.term for t in category.terms]
+    if not term_names:
+        return []
+
+    options = ", ".join(term_names)
+    instruction = _MODE_INSTRUCTIONS[category.mode]
+    system_prompt = (
+        f"An image was described by a vision model in response to the question: "
+        f"\"{category.question}\"\n"
+        f"Classify that description into one of these labels: {options}\n"
+        f"{instruction}"
+    )
+
+    logger.debug("llm classify [%s, %s]: answer=%r options=[%s]",
+                 category.name, category.mode.value, answer, options)
+    try:
+        result = run_llm(llm_config, system_prompt, f"Vision model response: {answer}")
+    except Exception as exc:
+        logger.warning("llm classify [%s]: %s", category.name, exc)
+        return []
+
+    # "none" means no label applies
+    if result.lower().strip() == "none":
+        logger.debug("llm classify [%s]: %r -> none", category.name, answer)
+        return []
+
+    # Build a lookup for case-insensitive matching
+    term_lookup = {t.term.lower(): t.term for t in category.terms}
+
+    # Parse comma-separated response (works for single-label too)
+    matched: list[str] = []
+    for part in result.split(","):
+        key = part.strip().lower()
+        if key in term_lookup:
+            matched.append(term_lookup[key])
+
+    if matched:
+        logger.debug("llm classify [%s]: %r -> %s", category.name, answer, matched)
+    else:
+        logger.debug("llm classify [%s]: %r -> no match (llm said %r)", category.name, answer, result)
+    return matched
+
+
+_AFFIRMATIVE = frozenset({"yes", "yeah", "yep", "true", "correct", "right"})
+
+
+def _run_term_prompts(
+    term_list: TermList,
+    category: Category,
+    paths: list[str],
+    max_tokens: int | None = None,
+    one_at_a_time: bool = False,
+) -> dict[str, list[str]]:
+    """Run per-term yes/no BLIP prompts and return matched terms per image.
+
+    For each term that has an `ask` field, asks BLIP the question for every
+    image and interprets the response as yes/no. Returns a mapping of
+    image path -> list of matched term names.
+    """
+    prompted_terms = [t for t in category.terms if t.ask]
+    if not prompted_terms:
+        return {}
+
+    # For each term, ask BLIP positive (and optionally negative) questions
+    # scores[image][term] = True/False
+    scores: dict[str, dict[str, bool]] = {p: {} for p in paths}
+
+    for t in prompted_terms:
+        logger.debug("term prompt [%s/%s]: %r on %d image(s)",
+                     category.name, t.term, t.ask, len(paths))
+        responses = run_blip(term_list, paths, prompt=t.ask, max_tokens=max_tokens,
+                            one_at_a_time=one_at_a_time)
+        # Collect positive answers
+        pos: dict[str, bool] = {}
+        for entry in responses:
+            answer = _get_answer(entry).lower().strip().rstrip(".")
+            is_yes = answer in _AFFIRMATIVE or answer.startswith("yes")
+            pos[entry["image"]] = is_yes
+            logger.debug("term prompt [%s/%s]: %s -> %r (%s)",
+                         category.name, t.term, Path(entry["image"]).name,
+                         answer, "yes" if is_yes else "no")
+
+        # If ask_negative is set, run the negative probe
+        neg: dict[str, bool] = {}
+        if t.ask_negative:
+            logger.debug("term prompt neg [%s/%s]: %r on %d image(s)",
+                         category.name, t.term, t.ask_negative, len(paths))
+            neg_responses = run_blip(term_list, paths, prompt=t.ask_negative,
+                                     max_tokens=max_tokens, one_at_a_time=one_at_a_time)
+            for entry in neg_responses:
+                answer = _get_answer(entry).lower().strip().rstrip(".")
+                is_yes = answer in _AFFIRMATIVE or answer.startswith("yes")
+                neg[entry["image"]] = is_yes
+                logger.debug("term prompt neg [%s/%s]: %s -> %r (%s)",
+                             category.name, t.term, Path(entry["image"]).name,
+                             answer, "yes" if is_yes else "no")
+
+        # Term matches when positive=yes AND (no negative probe OR negative=no)
+        for img_path in paths:
+            pos_yes = pos.get(img_path, False)
+            neg_yes = neg.get(img_path, False)
+            if t.ask_negative:
+                match = pos_yes and not neg_yes
+            else:
+                match = pos_yes
+            scores[img_path][t.term] = match
+
+    # Apply category mode to select terms
+    result: dict[str, list[str]] = {}
+    for img_path in paths:
+        img_scores = scores.get(img_path, {})
+        affirmed = [term for term, is_yes in img_scores.items() if is_yes]
+
+        if category.mode == CategoryMode.EXACTLY_ONE:
+            # Pick one — prefer affirmed, fall back to first prompted term
+            if len(affirmed) == 1:
+                result[img_path] = affirmed
+            elif len(affirmed) > 1:
+                result[img_path] = [affirmed[0]]  # first match
+            else:
+                result[img_path] = []
+        elif category.mode == CategoryMode.ZERO_OR_ONE:
+            if len(affirmed) == 1:
+                result[img_path] = affirmed
+            elif len(affirmed) > 1:
+                result[img_path] = [affirmed[0]]
+            else:
+                result[img_path] = []
+        elif category.mode == CategoryMode.ZERO_OR_MORE:
+            result[img_path] = affirmed
+
+    return result
+
+
 def _run_question(
     term_list: TermList,
     paths: list[str],
     question: str,
     existing_terms: set[str],
     max_tokens: int | None = None,
+    one_at_a_time: bool = False,
 ) -> tuple[CategoryProposal, dict[str, str]]:
     """Run a question against images and extract proposals.
 
@@ -90,7 +276,8 @@ def _run_question(
         Tuple of (CategoryProposal, per_image_answers) where per_image_answers
         maps image path to the VQA answer for that image.
     """
-    responses = run_blip(term_list, paths, prompt=question, max_tokens=max_tokens)
+    responses = run_blip(term_list, paths, prompt=question, max_tokens=max_tokens,
+                         one_at_a_time=one_at_a_time)
 
     # Collect raw answers
     answers: list[str] = []
@@ -159,6 +346,7 @@ def bootstrap(
     term_list: TermList,
     image_paths: list[str],
     sample: Optional[int] = None,
+    one_at_a_time: bool = False,
 ) -> SuggestResult:
     """Bootstrap mode: generate category/term proposals from BLIP captions.
 
@@ -168,6 +356,9 @@ def bootstrap(
     paths = image_paths
     if sample is not None and sample < len(paths):
         paths = random.sample(paths, sample)
+
+    logger.debug("bootstrap: %d image(s)%s", len(paths),
+                 f" (sampled from {len(image_paths)})" if sample else "")
 
     existing_terms: set[str] = set()
     for cat in term_list.categories:
@@ -181,18 +372,43 @@ def bootstrap(
         p: ImageSuggestion(image=p) for p in paths
     }
 
-    # Categories with questions get targeted VQA
+    # Categories with questions/per-term prompts get targeted VQA
     for cat in term_list.categories:
-        if not cat.question:
+        has_term_prompts = any(t.ask for t in cat.terms)
+        if not cat.question and not has_term_prompts:
             continue
 
-        cp, per_image = _run_question(term_list, paths, cat.question, existing_terms,
-                                      max_tokens=cat.question_answer_max_tokens)
+        # Per-term yes/no prompts take priority
+        if has_term_prompts:
+            logger.debug("bootstrap: per-term prompts for category %r", cat.name)
+            term_matches = _run_term_prompts(term_list, cat, paths,
+                                             max_tokens=cat.question_answer_max_tokens,
+                                             one_at_a_time=one_at_a_time)
+            classified_answers: list[str] = []
+            for img_path in paths:
+                matched = term_matches.get(img_path, [])
+                if matched:
+                    img_suggestions[img_path].labels.extend(matched)
+                    classified_answers.extend(matched)
+            cp = CategoryProposal(
+                category=cat.name,
+                question=cat.question,
+                answers=_dedupe(classified_answers),
+            )
+            if cp.answers:
+                proposals.append(cp)
+            continue
+
+        blip_prompt = cat.ask or cat.question
+        logger.debug("bootstrap: VQA for category %r: blip=%r question=%r",
+                     cat.name, blip_prompt, cat.question)
+        cp, per_image = _run_question(term_list, paths, blip_prompt, existing_terms,
+                                      max_tokens=cat.question_answer_max_tokens,
+                                      one_at_a_time=one_at_a_time)
         cp.category = cat.name
-        if cp.answers or cp.terms:
-            proposals.append(cp)
+        cp.question = cat.question
         # Classify per-image answers: matching taxonomy terms → labels, rest → mined
-        cat_term_set = {t.term.lower() for t in cat.terms}
+        classified_answers = []
         for img_path, answer in per_image.items():
             if img_path not in img_suggestions:
                 continue
@@ -200,12 +416,26 @@ def bootstrap(
             matched = [t.term for t in cat.terms if t.term.lower() in answer_words
                        or t.term.lower() == answer.strip().lower()]
             if matched:
+                logger.debug("bootstrap: %s [%s] word-matched %r -> %s",
+                             Path(img_path).name, cat.name, answer, matched)
+            if not matched:
+                matched = _classify_answer(term_list, answer, cat)
+            if matched:
                 img_suggestions[img_path].labels.extend(matched)
+                classified_answers.extend(matched)
             else:
+                logger.debug("bootstrap: %s [%s] unmatched %r -> mined",
+                             Path(img_path).name, cat.name, answer)
                 img_suggestions[img_path].mined_terms.append(answer)
+                classified_answers.append(answer)
+        # Replace raw BLIP answers with post-classification labels
+        cp.answers = _dedupe(classified_answers)
+        if cp.answers or cp.terms:
+            proposals.append(cp)
 
     # Open-ended captioning for general discovery
-    captions = run_blip(term_list, paths)
+    logger.debug("bootstrap: open-ended captioning on %d image(s)", len(paths))
+    captions = run_blip(term_list, paths, one_at_a_time=one_at_a_time)
 
     word_counts: Counter[str] = Counter()
     for entry in captions:
@@ -241,6 +471,7 @@ def expand(
     term_list: TermList,
     image_paths: list[str],
     sample: Optional[int] = None,
+    one_at_a_time: bool = False,
 ) -> SuggestResult:
     """Expand mode: propose new terms within existing categories.
 
@@ -252,6 +483,9 @@ def expand(
     if sample is not None and sample < len(paths):
         paths = random.sample(paths, sample)
 
+    logger.debug("expand: %d image(s)%s", len(paths),
+                 f" (sampled from {len(image_paths)})" if sample else "")
+
     # Collect existing terms for filtering
     existing_terms = set()
     for cat in term_list.categories:
@@ -259,7 +493,7 @@ def expand(
             existing_terms.add(t.term.lower())
 
     # Get CLIP scores for existing terms (may be empty if no terms)
-    clip_results = run_clip(term_list, paths)
+    clip_results = run_clip(term_list, paths, one_at_a_time=one_at_a_time)
 
     # Find images where no term scores well (potential gaps)
     threshold = term_list.defaults.threshold
@@ -268,6 +502,8 @@ def expand(
         scores = entry.get("scores", {})
         if not scores or max(scores.values()) < threshold:
             weak_images.append(entry["image"])
+
+    logger.debug("expand: %d weak image(s) (below threshold %.2f)", len(weak_images), threshold)
 
     proposals = []
 
@@ -278,18 +514,47 @@ def expand(
         flat_scores = entry.get("scores", {})
         detected = _detect_labels(term_list, flat_scores)
         img_suggestions[image] = ImageSuggestion(image=image, labels=detected)
+        if detected:
+            logger.debug("expand: %s CLIP detected: %s", Path(image).name, detected)
 
-    # For categories with questions, use targeted BLIP prompts on all images
+    # For categories with questions/per-term prompts, use targeted BLIP prompts
     for cat in term_list.categories:
-        if not cat.question:
+        has_term_prompts = any(t.ask for t in cat.terms)
+        if not cat.question and not has_term_prompts:
             continue
 
-        cp, per_image = _run_question(term_list, paths, cat.question, existing_terms,
-                                      max_tokens=cat.question_answer_max_tokens)
+        # Per-term yes/no prompts take priority
+        if has_term_prompts:
+            logger.debug("expand: per-term prompts for category %r", cat.name)
+            term_matches = _run_term_prompts(term_list, cat, paths,
+                                             max_tokens=cat.question_answer_max_tokens,
+                                             one_at_a_time=one_at_a_time)
+            classified_answers: list[str] = []
+            for img_path in paths:
+                matched = term_matches.get(img_path, [])
+                if matched:
+                    if img_path in img_suggestions:
+                        img_suggestions[img_path].labels.extend(matched)
+                    classified_answers.extend(matched)
+            cp = CategoryProposal(
+                category=cat.name,
+                question=cat.question,
+                answers=_dedupe(classified_answers),
+            )
+            if cp.answers:
+                proposals.append(cp)
+            continue
+
+        blip_prompt = cat.ask or cat.question
+        logger.debug("expand: VQA for category %r: blip=%r question=%r",
+                     cat.name, blip_prompt, cat.question)
+        cp, per_image = _run_question(term_list, paths, blip_prompt, existing_terms,
+                                      max_tokens=cat.question_answer_max_tokens,
+                                      one_at_a_time=one_at_a_time)
         cp.category = cat.name
-        if cp.answers or cp.terms:
-            proposals.append(cp)
+        cp.question = cat.question
         # Classify per-image answers: matching taxonomy terms → labels, rest → mined
+        classified_answers = []
         for img_path, answer in per_image.items():
             if img_path not in img_suggestions:
                 continue
@@ -297,13 +562,27 @@ def expand(
             matched = [t.term for t in cat.terms if t.term.lower() in answer_words
                        or t.term.lower() == answer.strip().lower()]
             if matched:
+                logger.debug("expand: %s [%s] word-matched %r -> %s",
+                             Path(img_path).name, cat.name, answer, matched)
+            if not matched:
+                matched = _classify_answer(term_list, answer, cat)
+            if matched:
                 img_suggestions[img_path].labels.extend(matched)
+                classified_answers.extend(matched)
             else:
+                logger.debug("expand: %s [%s] unmatched %r -> mined",
+                             Path(img_path).name, cat.name, answer)
                 img_suggestions[img_path].mined_terms.append(answer)
+                classified_answers.append(answer)
+        # Replace raw BLIP answers with post-classification labels
+        cp.answers = _dedupe(classified_answers)
+        if cp.answers or cp.terms:
+            proposals.append(cp)
 
     # For weak images (no good CLIP match), use untargeted BLIP captions
     if weak_images:
-        captions = run_blip(term_list, weak_images)
+        logger.debug("expand: captioning %d weak image(s)", len(weak_images))
+        captions = run_blip(term_list, weak_images, one_at_a_time=one_at_a_time)
 
         word_counts: Counter[str] = Counter()
         for entry in captions:
