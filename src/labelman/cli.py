@@ -13,6 +13,7 @@ from pathlib import Path
 from .check import check
 from .integrations import get_descriptor, run_clip
 from .label import assemble_final_labels, load_manual_sidecar, merge_sidecars, write_csv, write_final_sidecar, write_report, write_sidecar
+from .rename import rename_term
 from .schema import parse
 from .suggest import bootstrap, expand, format_suggest_result, write_suggest_sidecar
 from .web import serve as web_serve
@@ -448,6 +449,30 @@ def cmd_ui(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rename(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    if not config_path.is_file():
+        print(f"Error: {config_path} not found", file=sys.stderr)
+        return 1
+
+    result = rename_term(
+        config_path=config_path,
+        old=args.old,
+        new=args.new,
+        dry_run=args.dry_run,
+    )
+
+    if result.error:
+        print(f"Error: {result.error}", file=sys.stderr)
+        return 1
+
+    prefix = "[dry run] " if args.dry_run else ""
+    for change in result.changes:
+        print(f"  {prefix}{change}")
+    print(f"{prefix}Renamed '{args.old}' -> '{args.new}' ({len(result.changes)} file(s))")
+    return 0
+
+
 def cmd_descriptor(args: argparse.Namespace) -> int:
     tool = args.tool
     try:
@@ -511,6 +536,13 @@ def build_parser() -> argparse.ArgumentParser:
     ui_p.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
     ui_p.add_argument("--port", type=int, default=7933, help="Port to bind to (default: 7933)")
 
+    # rename
+    rename_p = sub.add_parser("rename", help="Rename a term across config and sidecar files")
+    rename_p.add_argument("--old", required=True, help="Current term name")
+    rename_p.add_argument("--new", required=True, help="New term name")
+    rename_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
+    rename_p.add_argument("--dry-run", action="store_true", help="Show what would change without modifying files")
+
     # descriptor
     desc_p = sub.add_parser("descriptor", help="Print a Boutiques descriptor for a built-in integration")
     desc_p.add_argument("tool", choices=["blip", "clip"], help="Integration name")
@@ -553,6 +585,7 @@ def main(argv: list[str] | None = None) -> int:
         "suggest": cmd_suggest,
         "label": cmd_label,
         "apply": cmd_apply,
+        "rename": cmd_rename,
         "ui": cmd_ui,
         "descriptor": cmd_descriptor,
     }
