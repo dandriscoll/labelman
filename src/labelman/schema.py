@@ -63,10 +63,23 @@ class LLMConfig:
 
 
 @dataclass
+class QwenVLConfig:
+    """Configuration for a Qwen2.5-VL integration (OpenAI-compatible vision API).
+
+    Unlike CLIP which returns similarity scores, Qwen2.5-VL understands
+    category constraints (exactly-one, zero-or-one, zero-or-more) directly
+    and returns label selections per category.
+    """
+    endpoint: str
+    model: str = "Qwen2.5-VL-7B-Instruct"
+
+
+@dataclass
 class Integrations:
     blip: Optional[IntegrationConfig] = None
     clip: Optional[IntegrationConfig] = None
     llm: Optional[LLMConfig] = None
+    qwen_vl: Optional[QwenVLConfig] = None
 
 
 @dataclass
@@ -118,6 +131,21 @@ def _parse_integration(raw: dict, name: str, errors: list[str]) -> Optional[Inte
         errors.append(f"integrations.{name}: must specify 'endpoint' or 'script'")
         return None
     return IntegrationConfig(endpoint=endpoint, script=script)
+
+
+def _parse_qwen_vl_integration(raw: dict, errors: list[str]) -> Optional[QwenVLConfig]:
+    if not isinstance(raw, dict):
+        errors.append("integrations.qwen_vl: must be a mapping")
+        return None
+    endpoint = raw.get("endpoint")
+    if endpoint is None or not isinstance(endpoint, str):
+        errors.append("integrations.qwen_vl: must specify 'endpoint' as a string")
+        return None
+    model = raw.get("model", "Qwen2.5-VL-7B-Instruct")
+    if not isinstance(model, str):
+        errors.append("integrations.qwen_vl.model: must be a string")
+        model = "Qwen2.5-VL-7B-Instruct"
+    return QwenVLConfig(endpoint=endpoint, model=model)
 
 
 def _parse_llm_integration(raw: dict, errors: list[str]) -> Optional[LLMConfig]:
@@ -195,6 +223,8 @@ def parse(source: str | Path) -> TermList:
                 integrations_obj.clip = _parse_integration(integ_raw["clip"], "clip", errors)
             if "llm" in integ_raw:
                 integrations_obj.llm = _parse_llm_integration(integ_raw["llm"], errors)
+            if "qwen_vl" in integ_raw:
+                integrations_obj.qwen_vl = _parse_qwen_vl_integration(integ_raw["qwen_vl"], errors)
 
     # --- global_terms (optional) ---
     global_terms_list: list[str] = []

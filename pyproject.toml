@@ -12,6 +12,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+crop = [
+    "Pillow>=9.0",
+]
 dev = [
     "pytest>=7.0",
 ]

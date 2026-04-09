@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from .check import check
-from .integrations import get_descriptor, run_clip
+from .integrations import get_descriptor, run_clip, run_qwen_vl, test_blip_endpoint, test_clip_endpoint, test_llm_endpoint, test_qwen_vl_endpoint
 from .label import assemble_final_labels, load_manual_sidecar, merge_sidecars, write_csv, write_final_sidecar, write_report, write_sidecar
 from .rename import rename_term
 from .schema import parse
@@ -94,6 +94,9 @@ integrations:
   # llm:
   #   endpoint: http://localhost:11434/v1/chat/completions
   #   model: qwen3
+  # qwen_vl:
+  #   endpoint: http://localhost:8082/v1/chat/completions
+  #   model: Qwen2.5-VL-7B-Instruct
 
 # --- Categories ---
 # Each category is a labeling axis. The mode controls how many labels
@@ -260,12 +263,36 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
+    # Build on_image callback to write sidecars incrementally
+    dry_run = args.dry_run
+    output_dir = Path(args.txt_output) if args.txt_output else None
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    include_mined = args.include_mined
+    written_count = 0
+
+    def _on_image(suggestion, index, total):
+        nonlocal written_count
+        name = Path(suggestion.image).name
+        if not dry_run:
+            sidecar = write_suggest_sidecar(
+                term_list, suggestion,
+                include_mined=include_mined,
+                output_dir=output_dir,
+            )
+            written_count += 1
+            print(f"  [{index}/{total}] {name} -> {sidecar.name}", flush=True)
+        else:
+            print(f"  [{index}/{total}] {name}", flush=True)
+
     try:
         oaat = getattr(args, 'one_at_a_time', False)
         if args.mode == "bootstrap":
-            result = bootstrap(term_list, image_paths, sample=sample, one_at_a_time=oaat)
+            result = bootstrap(term_list, image_paths, sample=sample,
+                               one_at_a_time=oaat, on_image=_on_image)
         else:
-            result = expand(term_list, image_paths, sample=sample, one_at_a_time=oaat)
+            result = expand(term_list, image_paths, sample=sample,
+                            one_at_a_time=oaat, on_image=_on_image)
     except subprocess.CalledProcessError as e:
         for line in _integration_error_message(e):
             print(line, file=sys.stderr)
@@ -281,19 +308,8 @@ def cmd_suggest(args: argparse.Namespace) -> int:
     else:
         print(output, end="")
 
-    if not args.dry_run:
-        output_dir = Path(args.txt_output) if args.txt_output else None
-        if output_dir:
-            output_dir.mkdir(parents=True, exist_ok=True)
-        include_mined = args.include_mined
-        for suggestion in result.image_suggestions:
-            sidecar = write_suggest_sidecar(
-                term_list, suggestion,
-                include_mined=include_mined,
-                output_dir=output_dir,
-            )
-            print(f"  {Path(suggestion.image).name} -> {sidecar.name}")
-        print(f"Wrote {len(result.image_suggestions)} sidecar(s)")
+    if written_count:
+        print(f"Wrote {written_count} sidecar(s)")
 
     return 0
 
@@ -334,6 +350,17 @@ def _reshape_clip_scores(term_list, clip_results: list[dict]) -> dict[str, dict[
     return result
 
 
+def _resolve_provider(args: argparse.Namespace, term_list) -> str:
+    """Determine which provider to use for labeling."""
+    provider = getattr(args, "provider", None)
+    if provider:
+        return provider
+    # Auto-detect: prefer qwen_vl if configured, fall back to clip
+    if term_list.integrations.qwen_vl is not None:
+        return "qwen_vl"
+    return "clip"
+
+
 def cmd_label(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     if not config_path.is_file():
@@ -359,10 +386,21 @@ def cmd_label(args: argparse.Namespace) -> int:
         print("Error: no terms defined in any category — nothing to label", file=sys.stderr)
         return 1
 
+    provider = _resolve_provider(args, term_list)
+
+    # Validate provider config
+    if provider == "qwen_vl" and term_list.integrations.qwen_vl is None:
+        print("Error: --provider qwen_vl requires integrations.qwen_vl in labelman.yaml", file=sys.stderr)
+        return 1
+    if provider == "clip" and term_list.integrations.clip is None:
+        print("Error: --provider clip requires integrations.clip in labelman.yaml", file=sys.stderr)
+        return 1
+
     num_images = len(image_paths)
     num_cats = len(term_list.categories)
     if not quiet:
-        print(f"Labeling {num_images} images against {total_terms} terms in {num_cats} categories...", flush=True)
+        print(f"Labeling {num_images} images against {total_terms} terms in {num_cats} categories "
+              f"(provider: {provider})...", flush=True)
 
     # Determine output directory
     output_dir = Path(args.output) if args.output else images_path
@@ -373,17 +411,27 @@ def cmd_label(args: argparse.Namespace) -> int:
     for i, image_path in enumerate(image_paths, 1):
         name = Path(image_path).name
 
-        # Score with CLIP
         try:
-            clip_results = run_clip(term_list, [image_path])
+            if provider == "qwen_vl":
+                vlm_labels = run_qwen_vl(term_list, image_path)
+                manual = load_manual_sidecar(image_path)
+                result = assemble_final_labels(
+                    term_list, image_path, scores={},
+                    manual_labels=manual, vlm_labels=vlm_labels,
+                )
+            else:
+                clip_results = run_clip(term_list, [image_path])
+                scores = _reshape_clip_scores(term_list, clip_results).get(image_path, {})
+                manual = load_manual_sidecar(image_path)
+                result = assemble_final_labels(term_list, image_path, scores, manual_labels=manual)
         except subprocess.CalledProcessError as e:
             for line in _integration_error_message(e):
                 print(line, file=sys.stderr)
             return 1
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
-        scores = _reshape_clip_scores(term_list, clip_results).get(image_path, {})
-        manual = load_manual_sidecar(image_path)
-        result = assemble_final_labels(term_list, image_path, scores, manual_labels=manual)
         results.append(result)
 
         # Write per-image detected sidecar
@@ -484,6 +532,45 @@ def cmd_descriptor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_test_endpoints(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    if not config_path.is_file():
+        print(f"Error: {config_path} not found", file=sys.stderr)
+        return 1
+
+    term_list = parse(config_path)
+    integ = term_list.integrations
+
+    # Build list of (name, url, test_fn) tuples
+    tests: list[tuple[str, str, callable]] = []
+    if integ.blip and integ.blip.endpoint:
+        tests.append(("blip", integ.blip.endpoint,
+                       lambda: test_blip_endpoint(integ.blip.endpoint)))
+    if integ.clip and integ.clip.endpoint:
+        tests.append(("clip", integ.clip.endpoint,
+                       lambda: test_clip_endpoint(integ.clip.endpoint)))
+    if integ.llm:
+        tests.append(("llm", integ.llm.endpoint,
+                       lambda: test_llm_endpoint(integ.llm)))
+    if integ.qwen_vl:
+        tests.append(("qwen_vl", integ.qwen_vl.endpoint,
+                       lambda: test_qwen_vl_endpoint(integ.qwen_vl)))
+
+    if not tests:
+        print("No endpoints configured in labelman.yaml")
+        return 0
+
+    any_failed = False
+    for name, url, test_fn in tests:
+        print(f"  {name:10s} {url} ... ", end="", flush=True)
+        ok, message = test_fn()
+        print(message)
+        if not ok:
+            any_failed = True
+
+    return 1 if any_failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="labelman", description="Bulk image labeling tool")
     sub = parser.add_subparsers(dest="command")
@@ -522,6 +609,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Output directory for sidecars, CSV, and report (default: same as --images)")
     label_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
     label_p.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
+    label_p.add_argument("--provider", choices=["clip", "qwen_vl"], default=None,
+                         help="Classification provider (default: auto-detect from config, prefers qwen_vl)")
 
     # apply
     apply_p = sub.add_parser("apply", help="Merge .labels.txt + .detected.txt into final .txt sidecars")
@@ -538,14 +627,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     # rename
     rename_p = sub.add_parser("rename", help="Rename a term across config and sidecar files")
-    rename_p.add_argument("--old", required=True, help="Current term name")
-    rename_p.add_argument("--new", required=True, help="New term name")
+    rename_p.add_argument("old", help="Current term name")
+    rename_p.add_argument("new", help="New term name")
     rename_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
     rename_p.add_argument("--dry-run", action="store_true", help="Show what would change without modifying files")
 
     # descriptor
     desc_p = sub.add_parser("descriptor", help="Print a Boutiques descriptor for a built-in integration")
     desc_p.add_argument("tool", choices=["blip", "clip"], help="Integration name")
+
+    # test-endpoints
+    test_p = sub.add_parser("test-endpoints", help="Test connectivity to configured endpoints")
+    test_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
 
     return parser
 
@@ -588,6 +681,7 @@ def main(argv: list[str] | None = None) -> int:
         "rename": cmd_rename,
         "ui": cmd_ui,
         "descriptor": cmd_descriptor,
+        "test-endpoints": cmd_test_endpoints,
     }
     return handlers[args.command](args)
 

@@ -7,14 +7,17 @@ import random
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from pathlib import Path
 
-from .integrations import run_blip, run_clip, run_llm
+from .integrations import run_blip, run_clip, run_llm, run_qwen_vl, run_qwen_vl_describe, run_qwen_vl_vqa
 from .schema import Category, CategoryMode, TermList
 
 logger = logging.getLogger("labelman")
+
+# Callback type: (suggestion, current_index, total_count) -> None
+_ImageCallback = Callable[["ImageSuggestion", int, int], None]
 
 
 @dataclass
@@ -164,6 +167,10 @@ def _classify_answer(
         if key in term_lookup:
             matched.append(term_lookup[key])
 
+    # Enforce category mode constraints on the parsed result
+    if matched and category.mode in (CategoryMode.EXACTLY_ONE, CategoryMode.ZERO_OR_ONE):
+        matched = matched[:1]
+
     if matched:
         logger.debug("llm classify [%s]: %r -> %s", category.name, answer, matched)
     else:
@@ -172,6 +179,26 @@ def _classify_answer(
 
 
 _AFFIRMATIVE = frozenset({"yes", "yeah", "yep", "true", "correct", "right"})
+
+
+def _suggest_provider(term_list: TermList) -> str:
+    """Determine which provider to use for suggest workflows.
+
+    Returns 'blip_clip' if both are configured, 'qwen_vl' if qwen_vl is
+    configured, or raises ValueError if neither is available.
+    """
+    has_blip = term_list.integrations.blip is not None
+    has_clip = term_list.integrations.clip is not None
+    has_qwen = term_list.integrations.qwen_vl is not None
+
+    if has_blip or has_clip:
+        return "blip_clip"
+    if has_qwen:
+        return "qwen_vl"
+    raise ValueError(
+        "No integrations configured for suggest. "
+        "Configure blip+clip or qwen_vl in labelman.yaml."
+    )
 
 
 def _run_term_prompts(
@@ -317,6 +344,141 @@ def _run_question(
     ), per_image_answers
 
 
+def _run_qwen_vl_term_prompts(
+    term_list: TermList,
+    category: Category,
+    paths: list[str],
+    max_tokens: int | None = None,
+) -> dict[str, list[str]]:
+    """Run per-term yes/no VQA using Qwen2.5-VL instead of BLIP.
+
+    For each term with an `ask` field, asks qwen_vl the question and
+    interprets the answer. Returns image path -> matched term names.
+    """
+    config = term_list.integrations.qwen_vl
+    if config is None:
+        return {}
+
+    prompted_terms = [t for t in category.terms if t.ask]
+    if not prompted_terms:
+        return {}
+
+    scores: dict[str, dict[str, bool]] = {p: {} for p in paths}
+
+    for t in prompted_terms:
+        logger.debug("qwen_vl term prompt [%s/%s]: %r on %d image(s)",
+                     category.name, t.term, t.ask, len(paths))
+        for img_path in paths:
+            answer = run_qwen_vl_vqa(config, img_path, t.ask,
+                                     max_tokens=max_tokens or 20)
+            is_yes = answer.lower().strip().rstrip(".") in _AFFIRMATIVE or answer.lower().startswith("yes")
+            scores[img_path][t.term] = is_yes
+            logger.debug("qwen_vl term prompt [%s/%s]: %s -> %r (%s)",
+                         category.name, t.term, Path(img_path).name,
+                         answer, "yes" if is_yes else "no")
+
+            if t.ask_negative and is_yes:
+                neg_answer = run_qwen_vl_vqa(config, img_path, t.ask_negative,
+                                             max_tokens=max_tokens or 20)
+                neg_yes = neg_answer.lower().strip().rstrip(".") in _AFFIRMATIVE or neg_answer.lower().startswith("yes")
+                if neg_yes:
+                    scores[img_path][t.term] = False
+                    logger.debug("qwen_vl term prompt neg [%s/%s]: %s -> %r (negated)",
+                                 category.name, t.term, Path(img_path).name, neg_answer)
+
+    # Apply category mode
+    result: dict[str, list[str]] = {}
+    for img_path in paths:
+        affirmed = [term for term, is_yes in scores.get(img_path, {}).items() if is_yes]
+        if category.mode == CategoryMode.ZERO_OR_MORE:
+            result[img_path] = affirmed
+        elif affirmed:
+            result[img_path] = [affirmed[0]]
+        else:
+            result[img_path] = []
+    return result
+
+
+def _run_qwen_vl_question(
+    term_list: TermList,
+    paths: list[str],
+    question: str,
+    existing_terms: set[str],
+    max_tokens: int | None = None,
+) -> tuple[CategoryProposal, dict[str, str]]:
+    """Run a VQA question against images using Qwen2.5-VL instead of BLIP.
+
+    Returns (CategoryProposal, per_image_answers).
+    """
+    config = term_list.integrations.qwen_vl
+    assert config is not None
+
+    answers: list[str] = []
+    word_counts: Counter[str] = Counter()
+    per_image_answers: dict[str, str] = {}
+
+    for img_path in paths:
+        answer = run_qwen_vl_vqa(config, img_path, question,
+                                 max_tokens=max_tokens or 100)
+        if answer:
+            answers.append(answer)
+            per_image_answers[img_path] = answer
+            words = _extract_words(answer)
+            new_words = [w for w in words if w not in existing_terms]
+            word_counts.update(set(new_words))
+
+    min_count = 2 if len(paths) >= 4 else 1
+    candidates = [
+        Proposal(term=word, source_count=count)
+        for word, count in word_counts.most_common()
+        if count >= min_count
+    ]
+
+    unique_answers = _dedupe(answers)
+
+    return CategoryProposal(
+        category="",
+        question=question,
+        answers=unique_answers,
+        terms=candidates,
+    ), per_image_answers
+
+
+def _enforce_category_modes(term_list: TermList, labels: list[str]) -> list[str]:
+    """Enforce category mode constraints on a flat label list.
+
+    For exactly-one and zero-or-one categories, keeps only the first
+    matching term. For zero-or-more, keeps all. Labels not belonging to
+    any category are passed through unchanged.
+    """
+    # Build term -> category lookup
+    term_to_cat: dict[str, str] = {}
+    for cat in term_list.categories:
+        for t in cat.terms:
+            term_to_cat[t.term] = cat.name
+
+    # Track which categories have already emitted a label
+    cat_emitted: dict[str, int] = {}
+    exclusive_modes = {CategoryMode.EXACTLY_ONE, CategoryMode.ZERO_OR_ONE}
+    cat_mode: dict[str, CategoryMode] = {cat.name: cat.mode for cat in term_list.categories}
+
+    result: list[str] = []
+    for label in labels:
+        cat_name = term_to_cat.get(label)
+        if cat_name is None:
+            # Not a taxonomy term — pass through
+            result.append(label)
+            continue
+        mode = cat_mode[cat_name]
+        if mode in exclusive_modes:
+            if cat_emitted.get(cat_name, 0) >= 1:
+                continue  # already have one for this category
+        cat_emitted[cat_name] = cat_emitted.get(cat_name, 0) + 1
+        result.append(label)
+
+    return result
+
+
 def _detect_labels(term_list: TermList, flat_scores: dict[str, float]) -> list[str]:
     """Detect labels for an image from flat CLIP scores using category rules."""
     labels: list[str] = []
@@ -342,32 +504,15 @@ def _detect_labels(term_list: TermList, flat_scores: dict[str, float]) -> list[s
     return labels
 
 
-def bootstrap(
+def _bootstrap_blip_clip(
     term_list: TermList,
-    image_paths: list[str],
-    sample: Optional[int] = None,
+    paths: list[str],
+    existing_terms: set[str],
     one_at_a_time: bool = False,
+    on_image: Optional[_ImageCallback] = None,
 ) -> SuggestResult:
-    """Bootstrap mode: generate category/term proposals from BLIP captions.
-
-    For categories with a question, uses VQA to get targeted answers.
-    For everything else, uses open-ended captioning.
-    """
-    paths = image_paths
-    if sample is not None and sample < len(paths):
-        paths = random.sample(paths, sample)
-
-    logger.debug("bootstrap: %d image(s)%s", len(paths),
-                 f" (sampled from {len(image_paths)})" if sample else "")
-
-    existing_terms: set[str] = set()
-    for cat in term_list.categories:
-        for t in cat.terms:
-            existing_terms.add(t.term.lower())
-
+    """Bootstrap using BLIP captions and CLIP scoring (original path)."""
     proposals = []
-
-    # Per-image tracking
     img_suggestions: dict[str, ImageSuggestion] = {
         p: ImageSuggestion(image=p) for p in paths
     }
@@ -407,7 +552,6 @@ def bootstrap(
                                       one_at_a_time=one_at_a_time)
         cp.category = cat.name
         cp.question = cat.question
-        # Classify per-image answers: matching taxonomy terms → labels, rest → mined
         classified_answers = []
         for img_path, answer in per_image.items():
             if img_path not in img_suggestions:
@@ -428,7 +572,6 @@ def bootstrap(
                              Path(img_path).name, cat.name, answer)
                 img_suggestions[img_path].mined_terms.append(answer)
                 classified_answers.append(answer)
-        # Replace raw BLIP answers with post-classification labels
         cp.answers = _dedupe(classified_answers)
         if cp.answers or cp.terms:
             proposals.append(cp)
@@ -440,8 +583,7 @@ def bootstrap(
     word_counts: Counter[str] = Counter()
     for entry in captions:
         words = _extract_words(_get_answer(entry))
-        word_counts.update(set(words))  # count each word once per image
-        # Track per-image mined terms
+        word_counts.update(set(words))
         img = entry["image"]
         if img in img_suggestions:
             new_words = [w for w in words if w not in existing_terms]
@@ -460,38 +602,181 @@ def bootstrap(
             terms=candidates,
         ))
 
+    suggestions = list(img_suggestions.values())
+    for sugg in suggestions:
+        sugg.labels = _enforce_category_modes(term_list, sugg.labels)
+    if on_image:
+        for i, sugg in enumerate(suggestions, 1):
+            on_image(sugg, i, len(suggestions))
+
     return SuggestResult(
         mode="bootstrap",
         proposals=proposals,
-        image_suggestions=list(img_suggestions.values()),
+        image_suggestions=suggestions,
     )
 
 
-def expand(
+def _bootstrap_qwen_vl(
+    term_list: TermList,
+    paths: list[str],
+    existing_terms: set[str],
+    on_image: Optional[_ImageCallback] = None,
+) -> SuggestResult:
+    """Bootstrap using Qwen2.5-VL for classification and captioning.
+
+    Processes each image through all phases (classify, VQA, describe) before
+    moving to the next, so sidecars can be written incrementally via on_image.
+    """
+    config = term_list.integrations.qwen_vl
+    assert config is not None
+
+    # Pre-compute which categories need VQA
+    vqa_cats: list[Category] = []
+    prompt_cats: list[Category] = []
+    for cat in term_list.categories:
+        has_term_prompts = any(t.ask for t in cat.terms)
+        if has_term_prompts:
+            prompt_cats.append(cat)
+        elif cat.question:
+            vqa_cats.append(cat)
+
+    # Per-category answer tracking (for proposals built after all images)
+    cat_answers: dict[str, list[str]] = {cat.name: [] for cat in vqa_cats + prompt_cats}
+
+    img_suggestions: list[ImageSuggestion] = []
+    word_counts: Counter[str] = Counter()
+
+    logger.debug("bootstrap: qwen_vl processing %d image(s) (classify + VQA + describe)",
+                 len(paths))
+
+    for i, img_path in enumerate(paths, 1):
+        sugg = ImageSuggestion(image=img_path)
+
+        # Phase 1: Classification against existing terms
+        if any(c.terms for c in term_list.categories):
+            labels = run_qwen_vl(term_list, img_path)
+            for cat_name, selected in labels.items():
+                if selected:
+                    sugg.labels.extend(selected)
+
+        # Phase 2: Per-term yes/no prompts
+        for cat in prompt_cats:
+            prompted_terms = [t for t in cat.terms if t.ask]
+            for t in prompted_terms:
+                answer = run_qwen_vl_vqa(config, img_path, t.ask,
+                                         max_tokens=cat.question_answer_max_tokens or 20)
+                is_yes = answer.lower().strip().rstrip(".") in _AFFIRMATIVE or answer.lower().startswith("yes")
+                if is_yes and t.ask_negative:
+                    neg = run_qwen_vl_vqa(config, img_path, t.ask_negative,
+                                          max_tokens=cat.question_answer_max_tokens or 20)
+                    if neg.lower().strip().rstrip(".") in _AFFIRMATIVE or neg.lower().startswith("yes"):
+                        is_yes = False
+                if is_yes:
+                    sugg.labels.append(t.term)
+                    cat_answers[cat.name].append(t.term)
+
+        # Phase 3: Category VQA questions
+        for cat in vqa_cats:
+            question = cat.ask or cat.question
+            answer = run_qwen_vl_vqa(config, img_path, question,
+                                     max_tokens=cat.question_answer_max_tokens or 100)
+            if answer:
+                answer_words = set(_extract_words(answer))
+                matched = [t.term for t in cat.terms if t.term.lower() in answer_words
+                           or t.term.lower() == answer.strip().lower()]
+                if matched:
+                    sugg.labels.extend(matched)
+                    cat_answers[cat.name].extend(matched)
+                else:
+                    sugg.mined_terms.append(answer)
+                    cat_answers[cat.name].append(answer)
+
+        # Phase 4: Open-ended description
+        description = run_qwen_vl_describe(config, img_path)
+        words = _extract_words(description)
+        word_counts.update(set(words))
+        new_words = [w for w in words if w not in existing_terms]
+        sugg.mined_terms.extend(new_words)
+
+        # Enforce category constraints (e.g. exactly-one gets only one label)
+        sugg.labels = _enforce_category_modes(term_list, sugg.labels)
+
+        img_suggestions.append(sugg)
+        if on_image:
+            on_image(sugg, i, len(paths))
+
+    # Build proposals from accumulated answers
+    proposals = []
+    for cat in prompt_cats + vqa_cats:
+        answers = cat_answers.get(cat.name, [])
+        if answers:
+            proposals.append(CategoryProposal(
+                category=cat.name,
+                question=cat.question,
+                answers=_dedupe(answers),
+            ))
+
+    min_count = 2 if len(paths) >= 4 else 1
+    candidates = [
+        Proposal(term=word, source_count=count)
+        for word, count in word_counts.most_common()
+        if count >= min_count
+    ]
+    if candidates:
+        proposals.append(CategoryProposal(
+            category="suggested",
+            terms=candidates,
+        ))
+
+    return SuggestResult(
+        mode="bootstrap",
+        proposals=proposals,
+        image_suggestions=img_suggestions,
+    )
+
+
+def bootstrap(
     term_list: TermList,
     image_paths: list[str],
     sample: Optional[int] = None,
     one_at_a_time: bool = False,
+    on_image: Optional[_ImageCallback] = None,
 ) -> SuggestResult:
-    """Expand mode: propose new terms within existing categories.
+    """Bootstrap mode: generate category/term proposals from image analysis.
 
-    Uses CLIP to score images against existing terms, then uses BLIP
-    (with per-category questions when available) to caption images that
-    score poorly, extracting candidate terms.
+    Uses BLIP/CLIP when configured, or Qwen2.5-VL as a standalone alternative.
+    When on_image is provided, it is called per-image as each suggestion is
+    ready, allowing incremental sidecar writes.
     """
     paths = image_paths
     if sample is not None and sample < len(paths):
         paths = random.sample(paths, sample)
 
-    logger.debug("expand: %d image(s)%s", len(paths),
+    logger.debug("bootstrap: %d image(s)%s", len(paths),
                  f" (sampled from {len(image_paths)})" if sample else "")
 
-    # Collect existing terms for filtering
-    existing_terms = set()
+    existing_terms: set[str] = set()
     for cat in term_list.categories:
         for t in cat.terms:
             existing_terms.add(t.term.lower())
 
+    provider = _suggest_provider(term_list)
+    logger.debug("bootstrap: using provider %s", provider)
+
+    if provider == "qwen_vl":
+        return _bootstrap_qwen_vl(term_list, paths, existing_terms, on_image=on_image)
+    return _bootstrap_blip_clip(term_list, paths, existing_terms,
+                                one_at_a_time=one_at_a_time, on_image=on_image)
+
+
+def _expand_blip_clip(
+    term_list: TermList,
+    paths: list[str],
+    existing_terms: set[str],
+    one_at_a_time: bool = False,
+    on_image: Optional[_ImageCallback] = None,
+) -> SuggestResult:
+    """Expand using CLIP scoring and BLIP captioning (original path)."""
     # Get CLIP scores for existing terms (may be empty if no terms)
     clip_results = run_clip(term_list, paths, one_at_a_time=one_at_a_time)
 
@@ -523,7 +808,6 @@ def expand(
         if not cat.question and not has_term_prompts:
             continue
 
-        # Per-term yes/no prompts take priority
         if has_term_prompts:
             logger.debug("expand: per-term prompts for category %r", cat.name)
             term_matches = _run_term_prompts(term_list, cat, paths,
@@ -553,7 +837,6 @@ def expand(
                                       one_at_a_time=one_at_a_time)
         cp.category = cat.name
         cp.question = cat.question
-        # Classify per-image answers: matching taxonomy terms → labels, rest → mined
         classified_answers = []
         for img_path, answer in per_image.items():
             if img_path not in img_suggestions:
@@ -574,7 +857,6 @@ def expand(
                              Path(img_path).name, cat.name, answer)
                 img_suggestions[img_path].mined_terms.append(answer)
                 classified_answers.append(answer)
-        # Replace raw BLIP answers with post-classification labels
         cp.answers = _dedupe(classified_answers)
         if cp.answers or cp.terms:
             proposals.append(cp)
@@ -589,7 +871,6 @@ def expand(
             words = _extract_words(_get_answer(entry))
             new_words = [w for w in words if w not in existing_terms]
             word_counts.update(set(new_words))
-            # Track per-image mined terms
             img = entry["image"]
             if img in img_suggestions:
                 img_suggestions[img].mined_terms.extend(new_words)
@@ -628,11 +909,190 @@ def expand(
                 terms=[Proposal(term=f"[unused: {t}]", source_count=0) for t in unused],
             ))
 
+    suggestions = list(img_suggestions.values())
+    for sugg in suggestions:
+        sugg.labels = _enforce_category_modes(term_list, sugg.labels)
+    if on_image:
+        for i, sugg in enumerate(suggestions, 1):
+            on_image(sugg, i, len(suggestions))
+
     return SuggestResult(
         mode="expand",
         proposals=proposals,
-        image_suggestions=list(img_suggestions.values()),
+        image_suggestions=suggestions,
     )
+
+
+def _expand_qwen_vl(
+    term_list: TermList,
+    paths: list[str],
+    existing_terms: set[str],
+    on_image: Optional[_ImageCallback] = None,
+) -> SuggestResult:
+    """Expand using Qwen2.5-VL for classification and captioning.
+
+    Processes each image through all phases (classify, VQA, describe if weak)
+    before moving to the next, so sidecars can be written incrementally.
+    """
+    config = term_list.integrations.qwen_vl
+    assert config is not None
+
+    # Pre-compute which categories need VQA
+    vqa_cats: list[Category] = []
+    prompt_cats: list[Category] = []
+    for cat in term_list.categories:
+        has_term_prompts = any(t.ask for t in cat.terms)
+        if has_term_prompts:
+            prompt_cats.append(cat)
+        elif cat.question:
+            vqa_cats.append(cat)
+
+    cat_answers: dict[str, list[str]] = {cat.name: [] for cat in vqa_cats + prompt_cats}
+    img_suggestions: list[ImageSuggestion] = []
+    word_counts: Counter[str] = Counter()
+
+    logger.debug("expand: qwen_vl processing %d image(s)", len(paths))
+
+    for i, img_path in enumerate(paths, 1):
+        sugg = ImageSuggestion(image=img_path)
+        is_weak = True
+
+        # Phase 1: Classification
+        if any(c.terms for c in term_list.categories):
+            labels = run_qwen_vl(term_list, img_path)
+            flat_labels = [t for terms in labels.values() for t in terms]
+            sugg.labels.extend(flat_labels)
+            if flat_labels:
+                is_weak = False
+                logger.debug("expand: %s qwen_vl detected: %s", Path(img_path).name, flat_labels)
+
+        # Phase 2: Per-term yes/no prompts
+        for cat in prompt_cats:
+            prompted_terms = [t for t in cat.terms if t.ask]
+            for t in prompted_terms:
+                answer = run_qwen_vl_vqa(config, img_path, t.ask,
+                                         max_tokens=cat.question_answer_max_tokens or 20)
+                is_yes = answer.lower().strip().rstrip(".") in _AFFIRMATIVE or answer.lower().startswith("yes")
+                if is_yes and t.ask_negative:
+                    neg = run_qwen_vl_vqa(config, img_path, t.ask_negative,
+                                          max_tokens=cat.question_answer_max_tokens or 20)
+                    if neg.lower().strip().rstrip(".") in _AFFIRMATIVE or neg.lower().startswith("yes"):
+                        is_yes = False
+                if is_yes:
+                    sugg.labels.append(t.term)
+                    cat_answers[cat.name].append(t.term)
+
+        # Phase 3: Category VQA questions
+        for cat in vqa_cats:
+            question = cat.ask or cat.question
+            answer = run_qwen_vl_vqa(config, img_path, question,
+                                     max_tokens=cat.question_answer_max_tokens or 100)
+            if answer:
+                answer_words = set(_extract_words(answer))
+                matched = [t.term for t in cat.terms if t.term.lower() in answer_words
+                           or t.term.lower() == answer.strip().lower()]
+                if matched:
+                    sugg.labels.extend(matched)
+                    cat_answers[cat.name].extend(matched)
+                else:
+                    sugg.mined_terms.append(answer)
+                    cat_answers[cat.name].append(answer)
+
+        # Phase 4: Describe weak images for term mining
+        if is_weak:
+            description = run_qwen_vl_describe(config, img_path)
+            words = _extract_words(description)
+            new_words = [w for w in words if w not in existing_terms]
+            word_counts.update(set(new_words))
+            sugg.mined_terms.extend(new_words)
+
+        # Enforce category constraints (e.g. exactly-one gets only one label)
+        sugg.labels = _enforce_category_modes(term_list, sugg.labels)
+
+        img_suggestions.append(sugg)
+        if on_image:
+            on_image(sugg, i, len(paths))
+
+    # Build proposals
+    proposals = []
+    for cat in prompt_cats + vqa_cats:
+        answers = cat_answers.get(cat.name, [])
+        if answers:
+            proposals.append(CategoryProposal(
+                category=cat.name,
+                question=cat.question,
+                answers=_dedupe(answers),
+            ))
+
+    # Uncategorized term proposals from weak image descriptions
+    if word_counts:
+        weak_count = sum(1 for s in img_suggestions if not s.labels)
+        min_count = 2 if weak_count >= 4 else 1
+        candidates = [
+            Proposal(term=word, source_count=count)
+            for word, count in word_counts.most_common()
+            if count >= min_count
+        ]
+        if candidates:
+            proposals.append(CategoryProposal(
+                category="uncategorized",
+                terms=candidates,
+            ))
+
+    # Report unused terms
+    term_counts: Counter[str] = Counter()
+    for sugg in img_suggestions:
+        term_counts.update(sugg.labels)
+    for cat in term_list.categories:
+        cat_terms = [t.term for t in cat.terms]
+        if not cat_terms:
+            continue
+        unused = [t for t in cat_terms if term_counts[t] == 0]
+        if unused:
+            proposals.append(CategoryProposal(
+                category=cat.name,
+                terms=[Proposal(term=f"[unused: {t}]", source_count=0) for t in unused],
+            ))
+
+    return SuggestResult(
+        mode="expand",
+        proposals=proposals,
+        image_suggestions=img_suggestions,
+    )
+
+
+def expand(
+    term_list: TermList,
+    image_paths: list[str],
+    sample: Optional[int] = None,
+    one_at_a_time: bool = False,
+    on_image: Optional[_ImageCallback] = None,
+) -> SuggestResult:
+    """Expand mode: propose new terms within existing categories.
+
+    Uses BLIP/CLIP when configured, or Qwen2.5-VL as a standalone alternative.
+    When on_image is provided, it is called per-image as each suggestion is
+    ready, allowing incremental sidecar writes.
+    """
+    paths = image_paths
+    if sample is not None and sample < len(paths):
+        paths = random.sample(paths, sample)
+
+    logger.debug("expand: %d image(s)%s", len(paths),
+                 f" (sampled from {len(image_paths)})" if sample else "")
+
+    existing_terms = set()
+    for cat in term_list.categories:
+        for t in cat.terms:
+            existing_terms.add(t.term.lower())
+
+    provider = _suggest_provider(term_list)
+    logger.debug("expand: using provider %s", provider)
+
+    if provider == "qwen_vl":
+        return _expand_qwen_vl(term_list, paths, existing_terms, on_image=on_image)
+    return _expand_blip_clip(term_list, paths, existing_terms,
+                             one_at_a_time=one_at_a_time, on_image=on_image)
 
 
 def format_suggest_result(result: SuggestResult) -> str:

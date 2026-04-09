@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import threading
 from functools import partial
 from http import HTTPStatus
@@ -294,6 +295,9 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             self._handle_apply(name)
         elif path == "/api/apply-all":
             self._handle_apply_all()
+        elif path.startswith("/api/images/") and path.endswith("/crop"):
+            name = unquote(path[len("/api/images/"):-len("/crop")])
+            self._handle_crop(name)
         else:
             self._send_error(404, "Not found")
 
@@ -468,6 +472,107 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             results.append({"name": img_name, "label_count": len(merged)})
         self._send_json({"applied": len(results), "results": results})
 
+    def _handle_crop(self, name: str) -> None:
+        """Crop an image, optionally saving as a copy."""
+        try:
+            from PIL import Image
+        except ImportError:
+            self._send_error(
+                500,
+                "Pillow is required for cropping. Install with: pip install Pillow",
+            )
+            return
+
+        data = self._parse_json_body()
+        if data is None:
+            return
+
+        x = data.get("x", 0)
+        y = data.get("y", 0)
+        w = data.get("width")
+        h = data.get("height")
+        mode = data.get("mode", "copy")  # "original" or "copy"
+
+        if w is None or h is None or w <= 0 or h <= 0:
+            self._send_error(400, "width and height are required and must be positive")
+            return
+
+        path = self.index.resolve_image(name)
+        if path is None:
+            self._send_error(404, "Image not found")
+            return
+
+        img = Image.open(path)
+        nat_w, nat_h = img.size
+
+        crop_x = int(round(x))
+        crop_y = int(round(y))
+        crop_w = int(round(w))
+        crop_h = int(round(h))
+
+        # Determine gray fill color based on image mode
+        if img.mode == "RGBA":
+            fill = (128, 128, 128, 255)
+        elif img.mode in ("RGB", "YCbCr"):
+            fill = (128, 128, 128)
+        elif img.mode == "L":
+            fill = 128
+        else:
+            # Convert to RGB for other modes
+            img = img.convert("RGB")
+            fill = (128, 128, 128)
+
+        result = Image.new(img.mode, (crop_w, crop_h), fill)
+
+        # Paste the relevant portion of the source image
+        src_x1 = max(0, crop_x)
+        src_y1 = max(0, crop_y)
+        src_x2 = min(nat_w, crop_x + crop_w)
+        src_y2 = min(nat_h, crop_y + crop_h)
+
+        if src_x2 > src_x1 and src_y2 > src_y1:
+            region = img.crop((src_x1, src_y1, src_x2, src_y2))
+            paste_x = max(0, -crop_x)
+            paste_y = max(0, -crop_y)
+            result.paste(region, (paste_x, paste_y))
+
+        # Save kwargs for format preservation
+        save_kwargs: dict = {}
+        fmt = path.suffix.lower()
+        if fmt in (".jpg", ".jpeg"):
+            save_kwargs["quality"] = 95
+            if result.mode == "RGBA":
+                result = result.convert("RGB")
+
+        if mode == "original":
+            result.save(path, **save_kwargs)
+            self.index.refresh()
+            self._send_json({"name": name, "mode": "original"})
+        else:
+            # Crop copy: foo.jpg -> foo-crop.jpg
+            stem = path.stem + "-crop"
+            new_path = path.parent / (stem + path.suffix)
+            counter = 1
+            while new_path.exists():
+                new_path = path.parent / (f"{path.stem}-crop{counter}" + path.suffix)
+                counter += 1
+
+            result.save(new_path, **save_kwargs)
+
+            # Copy all .txt sidecar files
+            for suffix in (".labels.txt", ".detected.txt", ".txt"):
+                sidecar = path.with_suffix(suffix)
+                if sidecar.is_file():
+                    new_sidecar = new_path.with_suffix(suffix)
+                    shutil.copy2(str(sidecar), str(new_sidecar))
+
+            self.index.refresh()
+            self._send_json({
+                "name": new_path.name,
+                "mode": "copy",
+                "original": name,
+            })
+
 
 def _get_display_host(host: str) -> str:
     """Get a usable hostname for display in the URL.
@@ -622,6 +727,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .divider { height: 1px; background: #333; margin: 12px 0; }
 .kbd { background: #333; border: 1px solid #555; border-radius: 3px; padding: 1px 5px; font-size: 10px; font-family: monospace; color: #aaa; }
 .help-bar { padding: 6px 12px; border-top: 1px solid #333; font-size: 11px; color: #666; display: flex; gap: 12px; flex-wrap: wrap; }
+.crop-controls { display: flex; align-items: center; gap: 6px; margin-left: 12px; }
+.crop-controls select, .crop-controls button { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 3px 8px; border-radius: 4px; font-size: 11px; cursor: pointer; }
+.crop-controls button:disabled { opacity: 0.3; cursor: not-allowed; }
+.crop-controls button.crop-apply { background: #1e2a1e; border-color: #4caf50; color: #4caf50; }
+.crop-controls button.crop-apply:disabled { background: #0f3460; border-color: #444; color: #e0e0e0; }
+.crop-controls label { font-size: 11px; color: #aaa; cursor: pointer; display: flex; align-items: center; gap: 3px; }
+.crop-controls label input { cursor: pointer; }
+.crop-overlay { position: absolute; border: 2px dashed rgba(255,255,255,0.9); box-shadow: 0 0 0 9999px rgba(0,0,0,0.5); pointer-events: none; z-index: 10; }
+.preview.crop-mode { cursor: crosshair; }
+.preview.crop-mode img { cursor: crosshair; }
+.preview.crop-mode img.dragging { cursor: crosshair; }
 </style>
 </head>
 <body>
@@ -655,10 +771,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   <div class="main">
     <div class="main-header">
       <span class="title" id="current-name">No image selected</span>
+      <div class="crop-controls">
+        <select id="crop-mode">
+          <option value="none">No Crop</option>
+          <option value="original">Crop Original</option>
+          <option value="copy">Crop Copy</option>
+        </select>
+        <label title="Lock crop to 1:1 aspect ratio"><input type="checkbox" id="crop-lock"> 1:1</label>
+        <button id="btn-crop-apply" disabled>Apply Crop</button>
+      </div>
       <span id="save-status" style="font-size:12px;color:#4caf50"></span>
     </div>
     <div class="main-content">
       <div class="preview" id="preview">
+        <div id="crop-overlay" class="crop-overlay" style="display:none"></div>
         <span class="empty">Select an image to preview</span>
       </div>
       <div class="grid-area" id="grid-area" style="display:none">
@@ -918,6 +1044,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       $currentName.textContent = names[0];
       if (viewMode === 'list') {
         $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(names[0])}/thumb" />`;
+        $preview.appendChild($cropOverlay);
         resetZoom();
       }
       $addSection.style.display = 'block';
@@ -940,6 +1067,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     selectedSet.add(img.name);
     $currentName.textContent = img.name;
     $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(img.name)}/thumb" />`;
+    $preview.appendChild($cropOverlay);
     $addSection.style.display = 'block';
     $rawSection.style.display = 'block';
     document.getElementById('delete-section').style.display = 'block';
@@ -1525,6 +1653,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     }
   }
   document.addEventListener('keydown', (e) => {
+    // Crop mode: Enter applies, Escape cancels
+    if (isCropActive() && !(e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        clearCrop();
+        return;
+      }
+      if (e.key === 'Enter' && cropRect && !$btnCropApply.disabled) {
+        e.preventDefault();
+        $btnCropApply.click();
+        return;
+      }
+    }
     // Ctrl+Z/Y for selection undo/redo in grid mode
     if (viewMode === 'grid' && e.ctrlKey && e.key === 'z' && !(e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
       e.preventDefault();
@@ -1691,6 +1832,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     } else {
       $currentName.textContent = 'No image selected';
       $preview.innerHTML = '<span class="empty">No images remaining</span>';
+      $preview.appendChild($cropOverlay);
       $labelSection.innerHTML = '';
       $addSection.style.display = 'none';
       $rawSection.style.display = 'none';
@@ -1809,7 +1951,120 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const img = $preview.querySelector('img');
     if (!img) return;
     img.style.transform = `translate(${panX}px, ${panY}px) scale(${zoomLevel})`;
+    updateCropOverlay();
   }
+
+  // --- Crop state ---
+  let cropMode = 'none';  // 'none', 'original', 'copy'
+  let cropLock = false;   // 1:1 aspect ratio lock
+  let cropRect = null;    // {x, y, w, h} in image pixel coords
+  let cropDrawing = false;
+  let cropStartPx = {x: 0, y: 0};  // start of draw in image pixels
+  const $cropOverlay = document.getElementById('crop-overlay');
+  const $cropMode = document.getElementById('crop-mode');
+  const $cropLock = document.getElementById('crop-lock');
+  const $btnCropApply = document.getElementById('btn-crop-apply');
+
+  function isCropActive() { return cropMode !== 'none'; }
+
+  // Convert screen coords (relative to viewport) to image pixel coords
+  function screenToImagePixels(clientX, clientY) {
+    const img = $preview.querySelector('img');
+    if (!img || !img.naturalWidth || !img.naturalHeight) return null;
+    const imgRect = img.getBoundingClientRect();
+    if (!imgRect.width || !imgRect.height) return null;
+    const relX = clientX - imgRect.left;
+    const relY = clientY - imgRect.top;
+    const scaleX = img.naturalWidth / imgRect.width;
+    const scaleY = img.naturalHeight / imgRect.height;
+    return {x: relX * scaleX, y: relY * scaleY};
+  }
+
+  // Convert image pixel coords to screen position relative to preview container
+  function imagePixelsToPreview(px, py) {
+    const img = $preview.querySelector('img');
+    if (!img) return null;
+    const imgRect = img.getBoundingClientRect();
+    const previewRect = $preview.getBoundingClientRect();
+    const scaleX = img.naturalWidth / imgRect.width;
+    const scaleY = img.naturalHeight / imgRect.height;
+    return {
+      x: px / scaleX + imgRect.left - previewRect.left,
+      y: py / scaleY + imgRect.top - previewRect.top,
+    };
+  }
+
+  function updateCropOverlay() {
+    if (!cropRect || !isCropActive()) {
+      $cropOverlay.style.display = 'none';
+      return;
+    }
+    const topLeft = imagePixelsToPreview(cropRect.x, cropRect.y);
+    const botRight = imagePixelsToPreview(cropRect.x + cropRect.w, cropRect.y + cropRect.h);
+    if (!topLeft || !botRight) { $cropOverlay.style.display = 'none'; return; }
+    $cropOverlay.style.display = 'block';
+    $cropOverlay.style.left = topLeft.x + 'px';
+    $cropOverlay.style.top = topLeft.y + 'px';
+    $cropOverlay.style.width = (botRight.x - topLeft.x) + 'px';
+    $cropOverlay.style.height = (botRight.y - topLeft.y) + 'px';
+  }
+
+  function clearCrop() {
+    cropRect = null;
+    cropDrawing = false;
+    $cropOverlay.style.display = 'none';
+    $btnCropApply.disabled = true;
+  }
+
+  $cropMode.addEventListener('change', (e) => {
+    cropMode = e.target.value;
+    clearCrop();
+    if (isCropActive()) {
+      $preview.classList.add('crop-mode');
+    } else {
+      $preview.classList.remove('crop-mode');
+    }
+  });
+  $cropLock.addEventListener('change', (e) => { cropLock = e.target.checked; });
+
+  $btnCropApply.addEventListener('click', async () => {
+    if (!cropRect || !isCropActive()) return;
+    const name = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
+    if (!name) return;
+    $saveStatus.textContent = 'Cropping...';
+    $btnCropApply.disabled = true;
+    try {
+      const data = await api(`/api/images/${encodeURIComponent(name)}/crop`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          x: Math.round(cropRect.x),
+          y: Math.round(cropRect.y),
+          width: Math.round(cropRect.w),
+          height: Math.round(cropRect.h),
+          mode: cropMode,
+        }),
+      });
+      if (data.error) {
+        $saveStatus.textContent = data.error;
+      } else if (cropMode === 'original') {
+        $saveStatus.textContent = 'Cropped (original)';
+        // Reload current image (cache bust)
+        const img = $preview.querySelector('img');
+        if (img) img.src = img.src.split('?')[0] + '?t=' + Date.now();
+        await loadImages();
+      } else {
+        $saveStatus.textContent = `Copied to ${data.name}`;
+        await loadImages();
+      }
+    } catch (err) {
+      $saveStatus.textContent = 'Crop failed';
+    }
+    clearCrop();
+    setTimeout(() => { $saveStatus.textContent = ''; }, 3000);
+  });
+
+  // --- Mouse handling for zoom/pan/crop ---
   $preview.addEventListener('wheel', (e) => {
     const img = $preview.querySelector('img');
     if (!img) return;
@@ -1820,40 +2075,92 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const oldZoom = zoomLevel;
     const delta = e.deltaY > 0 ? 0.9 : 1.1;
     zoomLevel = Math.max(0.5, Math.min(20, zoomLevel * delta));
-    // Zoom toward cursor
     panX = mx - (mx - panX) * (zoomLevel / oldZoom);
     panY = my - (my - panY) * (zoomLevel / oldZoom);
     applyZoom();
   }, {passive: false});
+
   $preview.addEventListener('mousedown', (e) => {
     if (e.button !== 0) return;
     const img = $preview.querySelector('img');
     if (!img) return;
+
+    if (isCropActive()) {
+      // Start drawing crop rectangle
+      e.preventDefault();
+      const px = screenToImagePixels(e.clientX, e.clientY);
+      if (!px) return;
+      cropDrawing = true;
+      cropStartPx = px;
+      cropRect = {x: px.x, y: px.y, w: 0, h: 0};
+      $btnCropApply.disabled = true;
+      updateCropOverlay();
+      return;
+    }
+
+    // Normal pan
     isPanning = true;
     panStartX = e.clientX - panX;
     panStartY = e.clientY - panY;
     img.classList.add('dragging');
   });
+
   window.addEventListener('mousemove', (e) => {
+    if (cropDrawing) {
+      const px = screenToImagePixels(e.clientX, e.clientY);
+      if (!px) return;
+      let dx = px.x - cropStartPx.x;
+      let dy = px.y - cropStartPx.y;
+      if (cropLock) {
+        const side = Math.max(Math.abs(dx), Math.abs(dy));
+        dx = dx >= 0 ? side : -side;
+        dy = dy >= 0 ? side : -side;
+      }
+      cropRect = {
+        x: dx >= 0 ? cropStartPx.x : cropStartPx.x + dx,
+        y: dy >= 0 ? cropStartPx.y : cropStartPx.y + dy,
+        w: Math.abs(dx),
+        h: Math.abs(dy),
+      };
+      updateCropOverlay();
+      return;
+    }
     if (!isPanning) return;
     panX = e.clientX - panStartX;
     panY = e.clientY - panStartY;
     applyZoom();
   });
+
   window.addEventListener('mouseup', () => {
+    if (cropDrawing) {
+      cropDrawing = false;
+      if (cropRect && cropRect.w > 2 && cropRect.h > 2) {
+        $btnCropApply.disabled = false;
+      } else {
+        clearCrop();
+      }
+      return;
+    }
     if (!isPanning) return;
     isPanning = false;
     const img = $preview.querySelector('img');
     if (img) img.classList.remove('dragging');
   });
-  $preview.addEventListener('dblclick', () => resetZoom());
 
-  // Reset zoom when switching images
+  $preview.addEventListener('dblclick', () => {
+    if (isCropActive()) { clearCrop(); return; }
+    resetZoom();
+  });
+
+  // Reset zoom and crop when switching images
   const origSelectImage = selectImage;
   selectImage = function(idx) {
     resetZoom();
+    clearCrop();
     origSelectImage(idx);
   };
+
+  // Crop keyboard shortcuts — handled in the main keydown handler below
 
   // Grid double-click handlers are bound per-element in renderGrid()
 

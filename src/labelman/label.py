@@ -63,6 +63,15 @@ def apply_labels(term_list: TermList, image: str, scores: Scores) -> ImageLabels
     return ImageLabels(image=image, labels=labels, all_scores=scores)
 
 
+def apply_vlm_labels(term_list: TermList, image: str, vlm_labels: dict[str, list[str]]) -> ImageLabels:
+    """Create ImageLabels from direct VLM selections (no scores).
+
+    VLM providers like Qwen2.5-VL return label selections directly,
+    with category constraints already applied. No threshold logic needed.
+    """
+    return ImageLabels(image=image, labels=vlm_labels, all_scores={})
+
+
 def load_manual_sidecar(image_path: str) -> list[str]:
     """Load manual labels from a .labels.txt sidecar file if it exists.
 
@@ -85,19 +94,26 @@ def assemble_final_labels(
     image: str,
     scores: Scores,
     manual_labels: list[str] | None = None,
+    vlm_labels: dict[str, list[str]] | None = None,
 ) -> ImageLabels:
     """Assemble final labels for an image from all sources.
 
     Merge order:
       1. global_terms from labelman.yaml (applied to every image)
       2. manual sidecar labels (per-image overrides)
-      3. detected labels (from category/threshold rules)
+      3. detected labels (from category/threshold rules or VLM selections)
 
     Global and manual labels bypass detection, thresholds, and category
     semantics. They are literal labels. The final list is deduplicated
     while preserving first-occurrence order.
+
+    When vlm_labels is provided, those are used as detected labels instead
+    of running score-based threshold logic.
     """
-    detected = apply_labels(term_list, image, scores)
+    if vlm_labels is not None:
+        detected = apply_vlm_labels(term_list, image, vlm_labels)
+    else:
+        detected = apply_labels(term_list, image, scores)
 
     # Collect detected labels in category order
     detected_flat: list[str] = []

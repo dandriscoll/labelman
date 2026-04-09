@@ -152,7 +152,7 @@ def test_rename_cli(tmp_path, capsys):
     (base / "img1.detected.txt").write_text("person, calm")
 
     result = main([
-        "rename", "--old", "calm", "--new", "relaxed",
+        "rename", "calm", "relaxed",
         "--config", str(config_path),
     ])
     assert result == 0
@@ -166,7 +166,7 @@ def test_rename_cli_dry_run(tmp_path, capsys):
     (base / "img1.detected.txt").write_text("person, calm")
 
     result = main([
-        "rename", "--old", "calm", "--new", "relaxed",
+        "rename", "calm", "relaxed",
         "--config", str(config_path),
         "--dry-run",
     ])
@@ -180,7 +180,7 @@ def test_rename_cli_dry_run(tmp_path, capsys):
 def test_rename_cli_error(tmp_path, capsys):
     config_path, base = _setup(tmp_path)
     result = main([
-        "rename", "--old", "nope", "--new", "whatever",
+        "rename", "nope", "whatever",
         "--config", str(config_path),
     ])
     assert result == 1
