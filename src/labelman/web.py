@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import shutil
@@ -12,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .errors import UIServerError
 from .label import load_manual_sidecar, merge_sidecars, write_final_sidecar
 from .schema import ParseError, TermList, parse
 
@@ -62,6 +64,9 @@ class ImageIndex:
                 "name": cat.name,
                 "mode": cat.mode.value,
                 "terms": [t.term for t in cat.terms],
+                "open": cat.open,
+                "term_prefix": cat.term_prefix,
+                "term_suffix": cat.term_suffix,
             })
         result = {"categories": categories, "global_terms": term_list.global_terms}
         return result, term_list
@@ -71,6 +76,34 @@ class ImageIndex:
 
     def get_taxonomy(self) -> dict | None:
         return self._taxonomy
+
+    def config_path(self) -> Path:
+        return self.directory / "labelman.yaml"
+
+    def read_config_source(self) -> str | None:
+        """Return the raw YAML text, or None if labelman.yaml does not exist."""
+        p = self.config_path()
+        if not p.is_file():
+            return None
+        return p.read_text()
+
+    def write_config_source(self, text: str) -> list[str]:
+        """Validate `text` as a labelman.yaml and write it atomically.
+
+        Returns an empty list on success, or a list of error strings on
+        failure (parse/validation errors) without touching the file.
+        On success, reloads the in-memory taxonomy.
+        """
+        try:
+            parse(text)
+        except ParseError as e:
+            return list(e.errors)
+        p = self.config_path()
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(text)
+        tmp.replace(p)
+        self._taxonomy, self._term_list = self._load_taxonomy()
+        return []
 
     @property
     def total(self) -> int:
@@ -255,6 +288,8 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         elif path == "/api/taxonomy":
             taxonomy = self.index.get_taxonomy()
             self._send_json(taxonomy if taxonomy else {"categories": [], "global_terms": []})
+        elif path == "/api/taxonomy/source":
+            self._handle_get_taxonomy_source()
         else:
             self._send_error(404, "Not found")
 
@@ -268,6 +303,8 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/images/") and path.endswith("/detected"):
             name = unquote(path[len("/api/images/"):-len("/detected")])
             self._handle_put_detected(name)
+        elif path == "/api/taxonomy/source":
+            self._handle_put_taxonomy_source()
         else:
             self._send_error(404, "Not found")
 
@@ -472,6 +509,36 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             results.append({"name": img_name, "label_count": len(merged)})
         self._send_json({"applied": len(results), "results": results})
 
+    def _handle_get_taxonomy_source(self) -> None:
+        """Return the raw YAML text of labelman.yaml."""
+        source = self.index.read_config_source()
+        path = str(self.index.config_path())
+        if source is None:
+            # Seed with a minimal skeleton so the editor isn't empty.
+            source = (
+                "defaults:\n"
+                "  threshold: 0.3\n"
+                "categories: []\n"
+            )
+            self._send_json({"source": source, "path": path, "exists": False})
+            return
+        self._send_json({"source": source, "path": path, "exists": True})
+
+    def _handle_put_taxonomy_source(self) -> None:
+        """Replace labelman.yaml with the posted text after validating it."""
+        data = self._parse_json_body()
+        if data is None:
+            return
+        source = data.get("source")
+        if not isinstance(source, str):
+            self._send_error(400, "Expected 'source' field with YAML text")
+            return
+        errors = self.index.write_config_source(source)
+        if errors:
+            self._send_json({"ok": False, "errors": errors}, status=400)
+            return
+        self._send_json({"ok": True, "taxonomy": self.index.get_taxonomy()})
+
     def _handle_crop(self, name: str) -> None:
         """Crop an image, optionally saving as a copy."""
         try:
@@ -603,7 +670,28 @@ def serve(directory: Path, host: str = "0.0.0.0", port: int = 0) -> None:
         {"index": index},
     )
 
-    server = HTTPServer((host, port), handler_class)
+    try:
+        server = HTTPServer((host, port), handler_class)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            raise UIServerError(
+                f"Port {port} on {host} is already in use — another labelman ui "
+                f"instance (or some other service) is bound there. Stop it, or "
+                f"pass --port with a free port (e.g. --port {port + 1})."
+            ) from e
+        if e.errno == errno.EACCES:
+            raise UIServerError(
+                f"Permission denied binding {host}:{port}. Ports below 1024 "
+                f"require privileges — pick a higher port with --port."
+            ) from e
+        if e.errno in (errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT):
+            raise UIServerError(
+                f"Cannot bind to host {host!r}: {e.strerror}. Use --host with a "
+                f"valid address (e.g. 127.0.0.1 or 0.0.0.0)."
+            ) from e
+        raise UIServerError(
+            f"Failed to start UI server on {host}:{port}: {e.strerror or e}"
+        ) from e
     actual_port = server.server_address[1]
     display_host = _get_display_host(host)
     print(f"Labeling UI: http://{display_host}:{actual_port}")
@@ -721,6 +809,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .term-btn.partial { background: #2a2a1e; border-color: #b8860b; color: #daa520; }
 .term-btn.suppressed { background: #2a1a1e; border-color: #e94560; color: #e94560; text-decoration: line-through; opacity: 0.7; }
 .term-btn .term-remove { font-size: 11px; color: #e94560; margin-left: 2px; }
+.open-term-input { font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px dashed #555; background: #1a1a2e; color: #ddd; min-width: 120px; }
+.open-term-input:focus { outline: none; border-style: solid; border-color: #2980b9; }
+.tax-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.tax-modal-box { background: #16213e; border: 1px solid #444; border-radius: 6px; width: min(900px, 90vw); height: min(700px, 85vh); display: flex; flex-direction: column; }
+.tax-modal-head { display: flex; align-items: center; padding: 10px 14px; border-bottom: 1px solid #333; }
+.tax-modal-box textarea { flex: 1; background: #0f0f1e; color: #e0e0e0; border: 0; border-bottom: 1px solid #333; font-family: monospace; font-size: 13px; padding: 10px 14px; resize: none; outline: none; tab-size: 2; }
+.tax-modal-errors { background: #2a1a1e; color: #e94560; font-family: monospace; font-size: 12px; padding: 0; max-height: 30%; overflow-y: auto; border-bottom: 1px solid #333; }
+.tax-modal-errors:not(:empty) { padding: 8px 14px; }
+.tax-modal-errors .err-line { white-space: pre-wrap; margin: 2px 0; }
+.tax-modal-foot { display: flex; align-items: center; padding: 10px 14px; gap: 8px; }
+.tax-modal-foot button { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 5px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.tax-modal-foot button:hover { background: #1a5276; }
+.tax-modal-foot button.primary { background: #1e6b1e; border-color: #4caf50; }
+.tax-modal-foot button.primary:hover { background: #2e8b2e; }
 .add-label { display: flex; gap: 4px; margin-top: 8px; }
 .add-label input { flex: 1; background: #1a1a2e; color: #e0e0e0; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
 .add-label button { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; }
@@ -752,6 +854,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       <button id="btn-next-unlabeled" title="Skip to next image without .labels.txt">Next unlabeled</button>
       <button id="btn-hide-labeled" title="Hide images that have .labels.txt">Hide labeled</button>
       <button id="btn-refresh">Refresh</button>
+      <button id="btn-edit-taxonomy-list" title="Edit labelman.yaml">Edit taxonomy</button>
       <select id="per-page">
         <option value="25">25</option>
         <option value="50" selected>50</option>
@@ -794,6 +897,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
           <button id="btn-grid-redo" disabled title="Redo selection (Ctrl+Y)">Redo</button>
           <button id="btn-grid-hide-labeled" title="Hide images that have .labels.txt">Hide labeled</button>
           <button id="btn-grid-refresh">Refresh</button>
+          <button id="btn-edit-taxonomy" title="Edit labelman.yaml">Edit taxonomy</button>
           <select id="grid-per-page">
             <option value="25">25</option>
             <option value="50" selected>50</option>
@@ -848,6 +952,26 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     </div>
   </div>
 </div>
+
+<div id="taxonomy-modal" class="tax-modal" style="display:none">
+  <div class="tax-modal-box">
+    <div class="tax-modal-head">
+      <h3 style="margin:0;font-size:14px">Edit taxonomy</h3>
+      <span id="tax-modal-path" style="font-size:11px;color:#888;margin-left:8px"></span>
+      <span class="spacer" style="flex:1"></span>
+      <span id="tax-modal-status" style="font-size:11px;color:#888"></span>
+    </div>
+    <textarea id="tax-modal-textarea" spellcheck="false"></textarea>
+    <div id="tax-modal-errors" class="tax-modal-errors"></div>
+    <div class="tax-modal-foot">
+      <span style="font-size:11px;color:#888">Validated with <code>labelman check</code> before write. Ctrl+Enter to save.</span>
+      <span class="spacer" style="flex:1"></span>
+      <button id="tax-modal-cancel">Cancel</button>
+      <button id="tax-modal-save" class="primary">Save</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function() {
   let images = [];
@@ -1148,10 +1272,27 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     if (taxonomy && taxonomy.categories && taxonomy.categories.length > 0) {
       taxonomy.categories.forEach(cat => {
         const modeLabel = cat.mode === 'exactly-one' ? 'pick one' : cat.mode === 'zero-or-one' ? 'optional, pick one' : 'any';
-        html += `<div class="cat-section"><div class="cat-header">${esc(cat.name)} <span class="cat-mode">${modeLabel}</span></div><div class="term-grid">`;
+        const openSuffix = cat.open ? ' <span class="cat-mode">open</span>' : '';
+        html += `<div class="cat-section"><div class="cat-header">${esc(cat.name)} <span class="cat-mode">${modeLabel}</span>${openSuffix}</div><div class="term-grid">`;
         const isExclusive = cat.mode === 'exactly-one' || cat.mode === 'zero-or-one';
-        const hasManualSelection = isExclusive && cat.terms.some(t => additive.includes(t));
-        cat.terms.forEach(term => {
+
+        // Terms to render as buttons: closed hint terms plus, for open cats,
+        // any additional value present on this image that matches the pattern
+        // and doesn't resolve to a *different* category.
+        const buttonTerms = [...cat.terms];
+        if (cat.open) {
+          const extras = new Set();
+          for (const l of [...additive, ...detectedLabels]) {
+            if (buttonTerms.includes(l)) continue;
+            if (!matchesOpenPattern(cat, l)) continue;
+            if (assignTermToCategory(l) !== cat) continue; // closed term in another cat wins
+            extras.add(l);
+          }
+          for (const e of extras) buttonTerms.push(e);
+        }
+
+        const hasManualSelection = isExclusive && buttonTerms.some(t => additive.includes(t));
+        buttonTerms.forEach(term => {
           taxonomyTerms.add(term);
           const isManual = additive.includes(term);
           const isDetected = detectedLabels.includes(term);
@@ -1163,6 +1304,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
           else if (isDetected) cls += ' detected';
           html += `<button class="${cls}" data-term="${esc(term)}" data-cat="${esc(cat.name)}" data-mode="${cat.mode}">${esc(term)}</button>`;
         });
+
+        if (cat.open) {
+          const pfx = cat.term_prefix || '';
+          const sfx = cat.term_suffix || '';
+          const ph = (pfx ? pfx : '') + '…' + (sfx ? sfx : '');
+          html += `<input class="open-term-input" type="text" placeholder="add: ${esc(ph)}" data-cat="${esc(cat.name)}" data-prefix="${esc(pfx)}" data-suffix="${esc(sfx)}" data-mode="${cat.mode}" />`;
+        }
+
         html += '</div></div>';
       });
     }
@@ -1246,9 +1395,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       const additiveSet = new Set(additive);
       taxonomy.categories.forEach(cat => {
         if (cat.mode !== 'exactly-one' && cat.mode !== 'zero-or-one') return;
-        const manualInCat = cat.terms.filter(t => additiveSet.has(t));
+        // All values belonging to this category, across manual+detected.
+        const catMembers = new Set();
+        for (const l of [...additive, ...detectedLabels, ...cat.terms]) {
+          if (assignTermToCategory(l) === cat) catMembers.add(l);
+        }
+        const manualInCat = [...catMembers].filter(t => additiveSet.has(t));
         if (manualInCat.length > 0) {
-          cat.terms.forEach(t => { if (!additiveSet.has(t)) allSuppressions.add(t); });
+          catMembers.forEach(t => { if (!additiveSet.has(t)) allSuppressions.add(t); });
         }
       });
     }
@@ -1436,7 +1590,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     if (mode !== 'exactly-one' && mode !== 'zero-or-one') return;
     const catDef = taxonomy && taxonomy.categories.find(c => c.name === cat);
     if (!catDef) return;
-    catDef.terms.forEach(t => {
+    // Collect all sibling values: closed hint terms plus any open-pattern
+    // values currently on this image that resolve to this category.
+    const siblings = new Set(catDef.terms);
+    if (catDef.open) {
+      const additive = currentLabels.filter(l => !l.startsWith('-'));
+      for (const l of [...additive, ...detectedLabels]) {
+        if (assignTermToCategory(l) === catDef) siblings.add(l);
+      }
+    }
+    siblings.forEach(t => {
       if (t === term) return;
       // Remove manual selection
       const mIdx = currentLabels.indexOf(t);
@@ -1554,6 +1717,27 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         saveLabels(name);
       });
     });
+    $labelSection.querySelectorAll('.open-term-input').forEach(el => {
+      el.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        const body = el.value.trim();
+        if (!body) return;
+        const prefix = el.dataset.prefix || '';
+        const suffix = el.dataset.suffix || '';
+        const cat = el.dataset.cat;
+        const mode = el.dataset.mode;
+        const term = prefix + body + suffix;
+        // Exclusive-category: adding a new open value displaces siblings.
+        clearCategoryExclusives(term, cat, mode);
+        // Remove any explicit suppression that might exist for this value.
+        const sIdx = currentLabels.indexOf('-' + term);
+        if (sIdx >= 0) currentLabels.splice(sIdx, 1);
+        if (!currentLabels.includes(term)) currentLabels.push(term);
+        el.value = '';
+        saveLabels(name);
+      });
+    });
   }
 
   async function saveLabels(name) {
@@ -1609,6 +1793,33 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  // Mirror of schema.Category.matches_open_pattern / TermList.assign_term_to_category.
+  // Keep in sync with Python — closed-term exact match beats any open-pattern match.
+  function matchesOpenPattern(cat, term) {
+    if (!cat.open) return false;
+    const prefix = cat.term_prefix || '';
+    const suffix = cat.term_suffix || '';
+    if (!term.startsWith(prefix)) return false;
+    if (suffix && !term.endsWith(suffix)) return false;
+    const body = suffix
+      ? term.slice(prefix.length, term.length - suffix.length)
+      : term.slice(prefix.length);
+    return body.trim().length > 0;
+  }
+  function assignTermToCategory(term) {
+    if (!taxonomy || !taxonomy.categories) return null;
+    for (const cat of taxonomy.categories) {
+      if (cat.terms && cat.terms.includes(term)) return cat;
+    }
+    let best = null, bestAffix = -1;
+    for (const cat of taxonomy.categories) {
+      if (!matchesOpenPattern(cat, term)) continue;
+      const affix = (cat.term_prefix || '').length + (cat.term_suffix || '').length;
+      if (affix > bestAffix) { best = cat; bestAffix = affix; }
+    }
+    return best;
   }
 
   // Keyboard navigation (list mode only)
@@ -2163,6 +2374,82 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   // Crop keyboard shortcuts — handled in the main keydown handler below
 
   // Grid double-click handlers are bound per-element in renderGrid()
+
+  // --- Taxonomy editor modal ---
+  const $taxModal = document.getElementById('taxonomy-modal');
+  const $taxTextarea = document.getElementById('tax-modal-textarea');
+  const $taxErrors = document.getElementById('tax-modal-errors');
+  const $taxStatus = document.getElementById('tax-modal-status');
+  const $taxPath = document.getElementById('tax-modal-path');
+
+  async function openTaxonomyEditor() {
+    $taxErrors.innerHTML = '';
+    $taxStatus.textContent = 'Loading...';
+    $taxModal.style.display = 'flex';
+    try {
+      const data = await api('/api/taxonomy/source');
+      $taxTextarea.value = data.source || '';
+      $taxPath.textContent = data.path + (data.exists ? '' : '  (will be created)');
+      $taxStatus.textContent = '';
+      $taxTextarea.focus();
+    } catch (e) {
+      $taxStatus.textContent = 'Failed to load';
+      $taxErrors.innerHTML = `<div class="err-line">${esc(String(e))}</div>`;
+    }
+  }
+  function closeTaxonomyEditor() {
+    $taxModal.style.display = 'none';
+    $taxErrors.innerHTML = '';
+  }
+  async function saveTaxonomyEditor() {
+    $taxErrors.innerHTML = '';
+    $taxStatus.textContent = 'Saving...';
+    let res;
+    try {
+      res = await fetch('/api/taxonomy/source', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({source: $taxTextarea.value}),
+      });
+    } catch (e) {
+      $taxStatus.textContent = 'Save failed';
+      $taxErrors.innerHTML = `<div class="err-line">${esc(String(e))}</div>`;
+      return;
+    }
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) {
+      $taxStatus.textContent = 'Invalid — not saved';
+      const errs = (body && body.errors) || [body && body.error || 'Unknown error'];
+      $taxErrors.innerHTML = errs.map(e => `<div class="err-line">${esc(String(e))}</div>`).join('');
+      return;
+    }
+    $taxStatus.textContent = 'Saved';
+    taxonomy = body.taxonomy || taxonomy;
+    closeTaxonomyEditor();
+    // Re-render whatever view is active so new categories show up.
+    if (viewMode === 'grid') renderGrid(); else renderList();
+    const focusedName = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
+    if (focusedName) renderLabels(focusedName);
+  }
+
+  const $btnEditTax = document.getElementById('btn-edit-taxonomy');
+  if ($btnEditTax) $btnEditTax.addEventListener('click', openTaxonomyEditor);
+  const $btnEditTaxList = document.getElementById('btn-edit-taxonomy-list');
+  if ($btnEditTaxList) $btnEditTaxList.addEventListener('click', openTaxonomyEditor);
+  document.getElementById('tax-modal-cancel').addEventListener('click', closeTaxonomyEditor);
+  document.getElementById('tax-modal-save').addEventListener('click', saveTaxonomyEditor);
+  $taxTextarea.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      saveTaxonomyEditor();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeTaxonomyEditor();
+    }
+  });
+  $taxModal.addEventListener('click', (e) => {
+    if (e.target === $taxModal) closeTaxonomyEditor();
+  });
 
   // Initial load — taxonomy must resolve before images so renderLabels has global_terms
   api('/api/taxonomy').then(data => { taxonomy = data; }).catch(() => {}).then(() => loadImages());

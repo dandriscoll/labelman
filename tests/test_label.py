@@ -591,3 +591,72 @@ def test_assemble_zero_or_more_manual_does_not_displace():
     result = assemble_final_labels(tl, "img.jpg", scores, manual_labels=manual)
     assert "calm" in result.final_labels
     assert "energetic" in result.final_labels
+
+
+# --- Open-term category assembly ---
+
+def test_assemble_open_exclusive_manual_displaces_detected_open_value():
+    """An exactly-one open category: adding a manual open value displaces a detected one."""
+    tl = _parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: color
+    mode: exactly-one
+    open: true
+    term_prefix: "color-"
+""")
+    # VLM detected color-red; user manually sets color-teal — the detected
+    # open value should be suppressed.
+    vlm_labels = {"color": ["color-red"]}
+    result = assemble_final_labels(
+        tl, "img.jpg", scores={}, manual_labels=["color-teal"], vlm_labels=vlm_labels
+    )
+    assert "color-teal" in result.final_labels
+    assert "color-red" not in result.final_labels
+
+
+def test_assemble_open_closed_term_wins_over_open_assignment():
+    """color-red is closed in cat A; cat B has open prefix color-. A wins."""
+    tl = _parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: prominent
+    mode: zero-or-one
+    terms:
+      - term: color-red
+  - name: palette
+    mode: exactly-one
+    open: true
+    term_prefix: "color-"
+""")
+    # Manual color-red should displace a detected color-red? No — only one
+    # copy. But the key assertion: color-red belongs to 'prominent', not
+    # 'palette'. So if 'palette' also has a detected color-teal, manual
+    # color-red does not displace color-teal (different categories).
+    vlm_labels = {"prominent": [], "palette": ["color-teal"]}
+    result = assemble_final_labels(
+        tl, "img.jpg", scores={}, manual_labels=["color-red"], vlm_labels=vlm_labels
+    )
+    assert "color-red" in result.final_labels
+    assert "color-teal" in result.final_labels
+
+
+def test_assemble_open_zero_or_more_does_not_displace():
+    tl = _parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: tags
+    mode: zero-or-more
+    open: true
+    term_prefix: "tag-"
+""")
+    vlm_labels = {"tags": ["tag-cat", "tag-fluffy"]}
+    result = assemble_final_labels(
+        tl, "img.jpg", scores={}, manual_labels=["tag-playful"], vlm_labels=vlm_labels
+    )
+    assert "tag-cat" in result.final_labels
+    assert "tag-fluffy" in result.final_labels
+    assert "tag-playful" in result.final_labels

@@ -505,5 +505,65 @@ categories:
     terms:
       - term: person
 """)
-        with pytest.raises(ValueError, match="not configured"):
+        from labelman.errors import IntegrationError
+        with pytest.raises(IntegrationError, match="not configured"):
             run_qwen_vl(tl, str(img))
+
+
+# --- Image downscaling ---
+
+class TestEncodeImage:
+    def test_downscale_large_image(self, tmp_path):
+        from PIL import Image
+        import base64 as _b64, io as _io
+        from labelman.integrations import _encode_image
+
+        img_path = tmp_path / "big.jpg"
+        Image.new("RGB", (4000, 3000), color=(128, 128, 128)).save(img_path, "JPEG", quality=95)
+        orig_pixels = 4000 * 3000
+
+        data, media = _encode_image(str(img_path), max_pixels=1_000_000)
+        assert media == "image/jpeg"
+        decoded = _b64.b64decode(data)
+        with Image.open(_io.BytesIO(decoded)) as out:
+            w, h = out.size
+            assert w * h <= 1_000_000
+            # Aspect ratio preserved within rounding tolerance
+            assert abs((w / h) - (4000 / 3000)) < 0.02
+
+    def test_small_image_not_resized(self, tmp_path):
+        from PIL import Image
+        import base64 as _b64, io as _io
+        from labelman.integrations import _encode_image
+
+        img_path = tmp_path / "small.jpg"
+        Image.new("RGB", (100, 100), color=(64, 64, 64)).save(img_path, "JPEG")
+
+        data, media = _encode_image(str(img_path), max_pixels=1_000_000)
+        decoded = _b64.b64decode(data)
+        with Image.open(_io.BytesIO(decoded)) as out:
+            assert out.size == (100, 100)
+
+    def test_max_pixels_zero_disables(self, tmp_path):
+        from PIL import Image
+        import base64 as _b64, io as _io
+        from labelman.integrations import _encode_image
+
+        img_path = tmp_path / "big.jpg"
+        Image.new("RGB", (3000, 2000), color=(0, 0, 0)).save(img_path, "JPEG")
+
+        data, media = _encode_image(str(img_path), max_pixels=0)
+        decoded = _b64.b64decode(data)
+        with Image.open(_io.BytesIO(decoded)) as out:
+            assert out.size == (3000, 2000)
+
+    def test_unreadable_falls_through(self, tmp_path):
+        from labelman.integrations import _encode_image
+        import base64 as _b64
+
+        img_path = tmp_path / "bogus.jpg"
+        img_path.write_bytes(b"not an image")
+
+        data, media = _encode_image(str(img_path), max_pixels=1_000_000)
+        assert _b64.b64decode(data) == b"not an image"
+        assert media == "image/jpeg"

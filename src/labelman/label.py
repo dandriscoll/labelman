@@ -134,15 +134,24 @@ def assemble_final_labels(
 
     # Implicit suppression: in exclusive categories (exactly-one, zero-or-one),
     # manually selecting a term displaces all other terms in that category.
+    # Works for open categories too via assign_term_to_category, so a manual
+    # "color-teal" displaces a previously-detected "color-red" in the same
+    # open category.
     additive_set = set(additive_manual)
     for cat in term_list.categories:
-        if cat.mode in (CategoryMode.EXACTLY_ONE, CategoryMode.ZERO_OR_ONE):
-            cat_terms = [t.term for t in cat.terms]
-            manual_in_cat = [t for t in cat_terms if t in additive_set]
-            if manual_in_cat:
-                for t in cat_terms:
-                    if t not in additive_set:
-                        suppressions.add(t)
+        if cat.mode not in (CategoryMode.EXACTLY_ONE, CategoryMode.ZERO_OR_ONE):
+            continue
+        manual_in_cat = [
+            t for t in additive_manual
+            if term_list.assign_term_to_category(t) is cat
+        ]
+        if not manual_in_cat:
+            continue
+        for t in [*detected_flat, *additive_manual]:
+            if t in additive_set and t in manual_in_cat:
+                continue
+            if term_list.assign_term_to_category(t) is cat and t not in manual_in_cat:
+                suppressions.add(t)
 
     # Merge in order: global, manual, detected — deduplicate and suppress
     merged: list[str] = []

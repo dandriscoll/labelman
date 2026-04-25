@@ -9,12 +9,10 @@ description = "Bulk image labeling tool for fine-tuning datasets"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",
+    "Pillow>=9.0",
 ]
 
 [project.optional-dependencies]
-crop = [
-    "Pillow>=9.0",
-]
 dev = [
     "pytest>=7.0",
 ]

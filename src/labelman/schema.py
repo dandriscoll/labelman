@@ -9,6 +9,8 @@ from typing import Optional
 
 import yaml
 
+from .errors import LabelmanError
+
 
 class CategoryMode(Enum):
     EXACTLY_ONE = "exactly-one"
@@ -33,6 +35,28 @@ class Category:
     question: Optional[str] = None
     ask: Optional[str] = None
     question_answer_max_tokens: Optional[int] = None
+    # Open-term categories accept arbitrary values matching a prefix and/or
+    # suffix pattern. The `terms` list still works as a set of known/hint
+    # values but is not exhaustive — the VLM can propose new ones.
+    open: bool = False
+    term_prefix: Optional[str] = None
+    term_suffix: Optional[str] = None
+
+    def matches_open_pattern(self, term: str) -> bool:
+        """True if `term` fits this category's open prefix/suffix pattern.
+
+        Only meaningful when `self.open` is True. Requires a non-empty body
+        between the affixes, so e.g. the bare prefix 'color-' on its own
+        does not match.
+        """
+        if not self.open:
+            return False
+        prefix = self.term_prefix or ""
+        suffix = self.term_suffix or ""
+        if not term.startswith(prefix) or not term.endswith(suffix):
+            return False
+        body = term[len(prefix): len(term) - len(suffix)] if suffix else term[len(prefix):]
+        return bool(body.strip())
 
 
 @dataclass
@@ -69,9 +93,16 @@ class QwenVLConfig:
     Unlike CLIP which returns similarity scores, Qwen2.5-VL understands
     category constraints (exactly-one, zero-or-one, zero-or-more) directly
     and returns label selections per category.
+
+    max_image_pixels caps the image area before base64 encoding. Qwen2.5-VL
+    uses roughly one vision token per 28×28 patch, so a 12MP image alone
+    consumes ~16K tokens — enough to overflow a 16K-context server. The
+    default of 4M pixels leaves headroom for the system prompt and response.
+    Set to 0 to disable downscaling.
     """
     endpoint: str
     model: str = "Qwen2.5-VL-7B-Instruct"
+    max_image_pixels: int = 4_000_000
 
 
 @dataclass
@@ -96,8 +127,36 @@ class TermList:
             return category.threshold
         return self.defaults.threshold
 
+    def assign_term_to_category(self, term: str) -> Optional[Category]:
+        """Resolve a label string to the category it belongs to.
 
-class ParseError(Exception):
+        Resolution order:
+          1. Exact match against a closed term (any category including open
+             categories' hint terms) — closed wins.
+          2. Longest prefix+suffix match against any open category's pattern.
+          3. None if no match.
+
+        This is what makes the UI 'smart' when closed and open terms
+        coexist: `color-red` resolves to the closed-term category even when
+        another category has an open `color-` prefix.
+        """
+        for cat in self.categories:
+            for t in cat.terms:
+                if t.term == term:
+                    return cat
+        best: Optional[Category] = None
+        best_affix_len = -1
+        for cat in self.categories:
+            if not cat.matches_open_pattern(term):
+                continue
+            affix_len = len(cat.term_prefix or "") + len(cat.term_suffix or "")
+            if affix_len > best_affix_len:
+                best = cat
+                best_affix_len = affix_len
+        return best
+
+
+class ParseError(LabelmanError):
     def __init__(self, errors: list[str]):
         self.errors = errors
         super().__init__("\n".join(errors))
@@ -145,7 +204,17 @@ def _parse_qwen_vl_integration(raw: dict, errors: list[str]) -> Optional[QwenVLC
     if not isinstance(model, str):
         errors.append("integrations.qwen_vl.model: must be a string")
         model = "Qwen2.5-VL-7B-Instruct"
-    return QwenVLConfig(endpoint=endpoint, model=model)
+    max_image_pixels = 4_000_000
+    if "max_image_pixels" in raw:
+        mp = raw["max_image_pixels"]
+        if not isinstance(mp, int) or isinstance(mp, bool) or mp < 0:
+            errors.append(
+                "integrations.qwen_vl.max_image_pixels: must be a non-negative integer "
+                "(0 disables downscaling)"
+            )
+        else:
+            max_image_pixels = mp
+    return QwenVLConfig(endpoint=endpoint, model=model, max_image_pixels=max_image_pixels)
 
 
 def _parse_llm_integration(raw: dict, errors: list[str]) -> Optional[LLMConfig]:
@@ -184,14 +253,26 @@ def parse(source: str | Path) -> TermList:
     """
     text = _load_text(source)
     errors: list[str] = []
+    source_label = str(source) if isinstance(source, Path) else "<yaml>"
 
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError as e:
-        raise ParseError([f"Invalid YAML: {e}"])
+        # PyYAML's MarkedYAMLError carries a problem_mark with line/column.
+        mark = getattr(e, "problem_mark", None)
+        problem = getattr(e, "problem", None) or str(e)
+        context = getattr(e, "context", None)
+        lines = [f"Invalid YAML in {source_label}:"]
+        if mark is not None:
+            lines.append(f"  line {mark.line + 1}, column {mark.column + 1}: {problem}")
+        else:
+            lines.append(f"  {problem}")
+        if context:
+            lines.append(f"  ({context})")
+        raise ParseError(lines)
 
     if not isinstance(data, dict):
-        raise ParseError(["Top level must be a YAML mapping"])
+        raise ParseError([f"{source_label}: top level must be a YAML mapping"])
 
     # --- defaults ---
     if "defaults" not in data:
@@ -330,11 +411,46 @@ def parse(source: str | Path) -> TermList:
                     else:
                         cat_max_tokens = mt_val
 
-                # terms (optional when question is set)
+                # open / term_prefix / term_suffix (all optional)
+                cat_open = False
+                if "open" in cat_raw:
+                    o_val = cat_raw["open"]
+                    if not isinstance(o_val, bool):
+                        errors.append(f"{cat_ctx}.open: must be a boolean")
+                    else:
+                        cat_open = o_val
+
+                cat_prefix = None
+                if "term_prefix" in cat_raw:
+                    pv = cat_raw["term_prefix"]
+                    if not isinstance(pv, str) or not pv:
+                        errors.append(f"{cat_ctx}.term_prefix: must be a non-empty string")
+                    else:
+                        cat_prefix = pv
+
+                cat_suffix = None
+                if "term_suffix" in cat_raw:
+                    sv = cat_raw["term_suffix"]
+                    if not isinstance(sv, str) or not sv:
+                        errors.append(f"{cat_ctx}.term_suffix: must be a non-empty string")
+                    else:
+                        cat_suffix = sv
+
+                if cat_open and cat_prefix is None and cat_suffix is None:
+                    errors.append(
+                        f"{cat_ctx}: open categories require at least one of "
+                        f"'term_prefix' or 'term_suffix'"
+                    )
+                if not cat_open and (cat_prefix is not None or cat_suffix is not None):
+                    errors.append(
+                        f"{cat_ctx}: 'term_prefix'/'term_suffix' only apply when 'open: true'"
+                    )
+
+                # terms (optional when question is set OR the category is open)
                 has_question = cat_question is not None
                 if "terms" not in cat_raw:
-                    if not has_question:
-                        errors.append(f"{cat_ctx}: missing required key 'terms' (or provide a 'question')")
+                    if not has_question and not cat_open:
+                        errors.append(f"{cat_ctx}: missing required key 'terms' (or provide a 'question', or set 'open: true')")
                     terms_list = []
                 else:
                     terms_raw = cat_raw["terms"]
@@ -342,8 +458,8 @@ def parse(source: str | Path) -> TermList:
                         errors.append(f"{cat_ctx}.terms: must be a list")
                         terms_list = []
                     elif len(terms_raw) == 0:
-                        if not has_question:
-                            errors.append(f"{cat_ctx}.terms: must not be empty (or provide a 'question')")
+                        if not has_question and not cat_open:
+                            errors.append(f"{cat_ctx}.terms: must not be empty (or provide a 'question', or set 'open: true')")
                         terms_list = []
                     else:
                         terms_list = []
@@ -418,6 +534,9 @@ def parse(source: str | Path) -> TermList:
                             question=cat_question,
                             ask=cat_ask,
                             question_answer_max_tokens=cat_max_tokens,
+                            open=cat_open,
+                            term_prefix=cat_prefix,
+                            term_suffix=cat_suffix,
                         )
                     )
 

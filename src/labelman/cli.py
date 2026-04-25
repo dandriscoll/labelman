@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from .check import check
+from .errors import LabelmanError
 from .integrations import get_descriptor, run_clip, run_qwen_vl, test_blip_endpoint, test_clip_endpoint, test_llm_endpoint, test_qwen_vl_endpoint
 from .label import assemble_final_labels, load_manual_sidecar, merge_sidecars, write_csv, write_final_sidecar, write_report, write_sidecar
 from .rename import rename_term
@@ -256,6 +257,17 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         print(f"Error: no images found in {images_path}", file=sys.stderr)
         return 1
 
+    start_at = getattr(args, "start_at", None)
+    if start_at:
+        skipped = _skip_until(image_paths, start_at)
+        if skipped is None:
+            print(f"Error: --start-at {start_at!r} did not match any image in {images_path}",
+                  file=sys.stderr)
+            return 1
+        image_paths = image_paths[skipped:]
+        print(f"Resuming from {Path(image_paths[0]).name} (skipped {skipped} earlier image(s))",
+              flush=True)
+
     term_list = parse(config_path)
     try:
         sample = _parse_sample(args.sample, len(image_paths))
@@ -321,6 +333,19 @@ def _find_images(directory: Path) -> list[str]:
         str(p) for p in directory.iterdir()
         if p.suffix.lower() in extensions
     )
+
+
+def _skip_until(image_paths: list[str], marker: str) -> int | None:
+    """Return the index of the first image matching `marker`, or None.
+
+    Matching order: exact full-path match, then basename match. Useful for
+    resuming a run — the user can pass either the filename printed in the
+    progress log or the full path.
+    """
+    for i, p in enumerate(image_paths):
+        if p == marker or Path(p).name == marker:
+            return i
+    return None
 
 
 def _reshape_clip_scores(term_list, clip_results: list[dict]) -> dict[str, dict[str, dict[str, float]]]:
@@ -427,9 +452,6 @@ def cmd_label(args: argparse.Namespace) -> int:
         except subprocess.CalledProcessError as e:
             for line in _integration_error_message(e):
                 print(line, file=sys.stderr)
-            return 1
-        except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
             return 1
 
         results.append(result)
@@ -599,6 +621,9 @@ def build_parser() -> argparse.ArgumentParser:
     suggest_p.add_argument("--include-mined", action="store_true",
                            help="Include mined terms in .txt sidecars (default: only existing category labels)")
     suggest_p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to labelman.yaml")
+    suggest_p.add_argument("--start-at", default=None,
+                           help="Skip images before this filename (basename or full path). "
+                                "Useful for resuming an interrupted run.")
     suggest_p.add_argument("--one-at-a-time", action="store_true",
                            help="Send images to BLIP/CLIP one at a time (slower, but pinpoints errors)")
 
@@ -683,7 +708,18 @@ def main(argv: list[str] | None = None) -> int:
         "descriptor": cmd_descriptor,
         "test-endpoints": cmd_test_endpoints,
     }
-    return handlers[args.command](args)
+    try:
+        return handlers[args.command](args)
+    except LabelmanError as e:
+        # All user-facing errors (config parse, integration failures, UI
+        # bind errors, …) land here as clean single-/multi-line messages.
+        for line in str(e).splitlines() or [""]:
+            print(f"Error: {line}" if line and not line.startswith(" ") else line,
+                  file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

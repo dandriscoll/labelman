@@ -13,6 +13,7 @@ from typing import Optional
 
 import base64
 
+from .errors import IntegrationError
 from .schema import Category, CategoryMode, IntegrationConfig, LLMConfig, QwenVLConfig, TermList
 
 logger = logging.getLogger("labelman")
@@ -47,6 +48,34 @@ def _builtin_script(tool: str) -> Path:
     return _SCRIPTS_DIR / f"{tool}.sh"
 
 
+def _format_qwen_vl_http_error(
+    config: "QwenVLConfig",
+    code: int,
+    body: str,
+    image_path: Optional[str] = None,
+) -> str:
+    """Turn a Qwen-VL HTTP error into a user-actionable message.
+
+    Detects the vLLM 'max_tokens ... got -N' signature that means the image's
+    vision tokens filled the model context window, and explains it.
+    """
+    snippet = body[:400]
+    image_note = f" (image: {Path(image_path).name})" if image_path else ""
+
+    m = re.search(r"max_tokens\s+must\s+be\s+at\s+least\s+1,\s+got\s+(-?\d+)", body)
+    if m:
+        overflow = -int(m.group(1))
+        return (
+            f"Qwen VL request failed{image_note}: prompt exceeded the model's context window "
+            f"by ~{overflow} tokens. The image likely needs to be downscaled, or the server's "
+            f"--max-model-len increased. Endpoint: {config.endpoint}"
+        )
+
+    return (
+        f"Qwen VL request failed (HTTP {code}){image_note} at {config.endpoint}: {snippet}"
+    )
+
+
 def resolve_script(tool: str, config: Optional[IntegrationConfig]) -> tuple[str, Optional[str]]:
     """Resolve which script and endpoint to use for a given integration.
 
@@ -57,7 +86,7 @@ def resolve_script(tool: str, config: Optional[IntegrationConfig]) -> tuple[str,
         - If config is None, raises.
     """
     if config is None:
-        raise ValueError(
+        raise IntegrationError(
             f"Integration '{tool}' is not configured in labelman.yaml. "
             f"Add an integrations.{tool} section with 'endpoint' or 'script'."
         )
@@ -147,11 +176,22 @@ def run_llm(
     except urllib.error.HTTPError as e:
         error_body = e.read().decode(errors="replace")
         logger.debug("llm: HTTP %d: %s", e.code, error_body)
-        raise RuntimeError(
-            f"LLM request failed (HTTP {e.code}): {error_body[:200]}"
+        raise IntegrationError(
+            f"LLM request failed (HTTP {e.code}) at {config.endpoint}: {error_body[:200]}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise IntegrationError(
+            f"LLM endpoint unreachable at {config.endpoint}: {e.reason}. "
+            f"Check that the service is running and integrations.llm.endpoint is correct."
         ) from e
 
-    raw_content = result["choices"][0]["message"]["content"]
+    try:
+        raw_content = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise IntegrationError(
+            f"LLM endpoint at {config.endpoint} returned an unexpected response shape "
+            f"(expected OpenAI-compatible 'choices[0].message.content'): {str(result)[:200]}"
+        ) from e
     # Strip <think>...</think> blocks from reasoning models (e.g. qwen3)
     content = re.sub(r"<think>[\s\S]*?</think>", "", raw_content)
     content = content.strip()
@@ -202,8 +242,14 @@ def run_blip(
     return output
 
 
-def _encode_image(image_path: str) -> tuple[str, str]:
-    """Read an image file and return (base64_data, media_type)."""
+def _encode_image(image_path: str, max_pixels: int = 0) -> tuple[str, str]:
+    """Read an image file and return (base64_data, media_type).
+
+    When max_pixels > 0 and the image exceeds it, the image is downscaled
+    (preserving aspect ratio) and re-encoded as JPEG before base64. This
+    prevents vision-token counts from overflowing the server's context
+    window on large source images.
+    """
     p = Path(image_path)
     suffix = p.suffix.lower()
     media_types = {
@@ -215,8 +261,45 @@ def _encode_image(image_path: str) -> tuple[str, str]:
         ".tiff": "image/tiff",
     }
     media_type = media_types.get(suffix, "image/jpeg")
-    data = base64.b64encode(p.read_bytes()).decode("ascii")
-    return data, media_type
+
+    raw = p.read_bytes()
+
+    if max_pixels and max_pixels > 0:
+        try:
+            from PIL import Image
+        except ImportError:
+            logger.warning(
+                "Pillow not available; cannot downscale %s. Install with: pip install Pillow",
+                p.name,
+            )
+            return base64.b64encode(raw).decode("ascii"), media_type
+
+        import io
+        try:
+            with Image.open(io.BytesIO(raw)) as img:
+                w, h = img.size
+                if w * h > max_pixels:
+                    scale = (max_pixels / float(w * h)) ** 0.5
+                    new_w = max(1, int(w * scale))
+                    new_h = max(1, int(h * scale))
+                    logger.info(
+                        "qwen_vl: downscaling %s from %dx%d (%.1fMP) to %dx%d (%.1fMP)",
+                        p.name, w, h, (w * h) / 1e6, new_w, new_h, (new_w * new_h) / 1e6,
+                    )
+                    resized = img.resize((new_w, new_h), Image.LANCZOS)
+                    if resized.mode in ("RGBA", "LA", "P"):
+                        resized = resized.convert("RGB")
+                    out = io.BytesIO()
+                    resized.save(out, format="JPEG", quality=90)
+                    return base64.b64encode(out.getvalue()).decode("ascii"), "image/jpeg"
+        except (OSError, ValueError) as e:
+            # Unreadable / truncated / exotic format — fall through to raw
+            # base64 and let the server handle it. A real context overflow
+            # will then surface as the existing IntegrationError.
+            logger.warning("qwen_vl: could not decode %s for downscale (%s); sending as-is",
+                           p.name, e)
+
+    return base64.b64encode(raw).decode("ascii"), media_type
 
 
 def _build_category_spec(cat: Category) -> list[str]:
@@ -228,7 +311,9 @@ def _build_qwen_vl_system_prompt(term_list: TermList) -> str:
     """Build the system prompt with the allowed terms per category.
 
     Includes category mode constraints so the model understands
-    exactly-one vs zero-or-more semantics.
+    exactly-one vs zero-or-more semantics. Open categories (with
+    term_prefix/term_suffix) let the model propose new values shaped to
+    the affix pattern, with any listed `terms` acting as hints.
     """
     _mode_desc = {
         CategoryMode.EXACTLY_ONE: "Pick exactly one term (required).",
@@ -237,15 +322,36 @@ def _build_qwen_vl_system_prompt(term_list: TermList) -> str:
     }
     taxonomy: dict[str, dict] = {}
     for cat in term_list.categories:
-        taxonomy[cat.name] = {
-            "terms": _build_category_spec(cat),
-            "rule": _mode_desc[cat.mode],
-        }
+        entry: dict = {"rule": _mode_desc[cat.mode]}
+        if cat.open:
+            entry["open"] = True
+            if cat.term_prefix:
+                entry["term_prefix"] = cat.term_prefix
+            if cat.term_suffix:
+                entry["term_suffix"] = cat.term_suffix
+            entry["hint_terms"] = _build_category_spec(cat)
+        else:
+            entry["terms"] = _build_category_spec(cat)
+        taxonomy[cat.name] = entry
+
+    has_open = any(cat.open for cat in term_list.categories)
 
     lines = [
         "You are an image classifier. Classify the image into the categories below. "
-        "Each category lists its allowed terms and a selection rule. "
-        "Select only from the allowed terms and follow each category's rule strictly.",
+        "Each category lists a selection rule and either a closed list of allowed terms "
+        "or an open pattern.",
+        "",
+        "Closed categories: select only from 'terms'.",
+    ]
+    if has_open:
+        lines.append(
+            "Open categories (marked with 'open: true'): propose any concise, lowercase "
+            "term that fits the image AND starts with 'term_prefix' (if given) AND ends "
+            "with 'term_suffix' (if given). 'hint_terms' are known-good examples but you "
+            "are not limited to them. Keep the body (the text between the affixes) short "
+            "and kebab-case, e.g. 'color-dusty-teal'."
+        )
+    lines += [
         "",
         json.dumps(taxonomy, indent=2),
         "",
@@ -277,14 +383,14 @@ def run_qwen_vl(
     """
     config = term_list.integrations.qwen_vl
     if config is None:
-        raise ValueError(
+        raise IntegrationError(
             "Integration 'qwen_vl' is not configured in labelman.yaml. "
             "Add an integrations.qwen_vl section with 'endpoint' and 'model'."
         )
 
     system_prompt = _build_qwen_vl_system_prompt(term_list)
     user_text = _build_qwen_vl_user_prompt()
-    img_data, media_type = _encode_image(image_path)
+    img_data, media_type = _encode_image(image_path, max_pixels=config.max_image_pixels)
 
     body = {
         "model": config.model,
@@ -329,11 +435,22 @@ def run_qwen_vl(
     except urllib.error.HTTPError as e:
         error_body = e.read().decode(errors="replace")
         logger.debug("qwen_vl: HTTP %d: %s", e.code, error_body)
-        raise RuntimeError(
-            f"Qwen VL request failed (HTTP {e.code}): {error_body[:200]}"
+        raise IntegrationError(
+            _format_qwen_vl_http_error(config, e.code, error_body)
+        ) from e
+    except urllib.error.URLError as e:
+        raise IntegrationError(
+            f"Qwen VL endpoint unreachable at {config.endpoint}: {e.reason}. "
+            f"Check that the service is running and integrations.qwen_vl.endpoint is correct."
         ) from e
 
-    raw_content = result["choices"][0]["message"]["content"]
+    try:
+        raw_content = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise IntegrationError(
+            f"Qwen VL endpoint at {config.endpoint} returned an unexpected response shape "
+            f"(expected OpenAI-compatible 'choices[0].message.content'): {str(result)[:200]}"
+        ) from e
     # Strip <think>...</think> blocks if present
     content = re.sub(r"<think>[\s\S]*?</think>", "", raw_content).strip()
     # Strip markdown code fences if present
@@ -348,14 +465,24 @@ def run_qwen_vl(
         parsed = json.loads(content)
     except json.JSONDecodeError as e:
         logger.warning("qwen_vl: failed to parse JSON response: %s", content[:200])
-        raise RuntimeError(
-            f"Qwen VL returned invalid JSON: {content[:200]}"
+        raise IntegrationError(
+            f"Qwen VL returned invalid JSON (image: {Path(image_path).name}): {content[:200]}"
         ) from e
 
-    # Validate and normalize the response against the taxonomy
-    valid_terms: dict[str, set[str]] = {}
-    for cat in term_list.categories:
-        valid_terms[cat.name] = {t.term for t in cat.terms}
+    # Validate and normalize the response against the taxonomy.
+    # Closed categories: accept only listed terms.
+    # Open categories: accept any value matching the prefix/suffix pattern,
+    # plus hint terms verbatim.
+    closed_terms: dict[str, set[str]] = {
+        cat.name: {t.term for t in cat.terms} for cat in term_list.categories
+    }
+
+    def _accepts(cat: Category, value: str) -> bool:
+        if value in closed_terms.get(cat.name, set()):
+            return True
+        if cat.open and cat.matches_open_pattern(value):
+            return True
+        return False
 
     labels: dict[str, list[str]] = {}
     for cat in term_list.categories:
@@ -372,15 +499,20 @@ def run_qwen_vl(
         else:
             selected = [str(raw_value)]
 
-        # Filter to valid terms only
-        filtered = [t for t in selected if t in valid_terms.get(cat.name, set())]
+        filtered = [t for t in selected if _accepts(cat, t)]
+        rejected = [t for t in selected if not _accepts(cat, t)]
+        if rejected:
+            logger.debug("qwen_vl: %s rejected values %r (image %s)",
+                         cat.name, rejected, Path(image_path).name)
 
         # Enforce category constraints
         if cat.mode == CategoryMode.EXACTLY_ONE:
             if filtered:
                 labels[cat.name] = [filtered[0]]
-            elif cat.terms:
-                # Model failed to pick one — fall back to first term
+            elif cat.terms and not cat.open:
+                # Model failed to pick one — fall back to first term.
+                # Only meaningful for closed categories; open ones have no
+                # canonical default.
                 labels[cat.name] = [cat.terms[0].term]
                 logger.warning("qwen_vl: %s exactly-one fallback to %r for %s",
                                cat.name, cat.terms[0].term, Path(image_path).name)
@@ -407,7 +539,7 @@ def _qwen_vl_chat(
     Shared helper for classification, description, and VQA calls.
     Handles base64 encoding, think-tag stripping, and error handling.
     """
-    img_data, media_type = _encode_image(image_path)
+    img_data, media_type = _encode_image(image_path, max_pixels=config.max_image_pixels)
 
     body = {
         "model": config.model,
@@ -445,11 +577,22 @@ def _qwen_vl_chat(
     except urllib.error.HTTPError as e:
         error_body = e.read().decode(errors="replace")
         logger.debug("qwen_vl: HTTP %d: %s", e.code, error_body)
-        raise RuntimeError(
-            f"Qwen VL request failed (HTTP {e.code}): {error_body[:200]}"
+        raise IntegrationError(
+            _format_qwen_vl_http_error(config, e.code, error_body, image_path=image_path)
+        ) from e
+    except urllib.error.URLError as e:
+        raise IntegrationError(
+            f"Qwen VL endpoint unreachable at {config.endpoint}: {e.reason}. "
+            f"Check that the service is running and integrations.qwen_vl.endpoint is correct."
         ) from e
 
-    raw_content = result["choices"][0]["message"]["content"]
+    try:
+        raw_content = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise IntegrationError(
+            f"Qwen VL endpoint at {config.endpoint} returned an unexpected response shape "
+            f"(expected OpenAI-compatible 'choices[0].message.content'): {str(result)[:200]}"
+        ) from e
     content = re.sub(r"<think>[\s\S]*?</think>", "", raw_content).strip()
 
     logger.debug("qwen_vl: raw response: %s", raw_content[:300])

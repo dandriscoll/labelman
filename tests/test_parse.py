@@ -157,7 +157,7 @@ categories:
 # --- Structural errors ---
 
 def test_parse_empty_file():
-    with pytest.raises(ParseError, match="Top level must be a YAML mapping"):
+    with pytest.raises(ParseError, match="top level must be a YAML mapping"):
         parse("")
 
 
@@ -602,3 +602,131 @@ categories:
         ask: "Is x?"
 """)
     assert tl.categories[0].terms[0].ask_negative is None
+
+
+# --- Open-term categories ---
+
+def test_parse_open_category_prefix():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: color
+    mode: zero-or-more
+    open: true
+    term_prefix: "color-"
+    terms:
+      - term: color-red
+      - term: color-blue
+""")
+    cat = tl.categories[0]
+    assert cat.open is True
+    assert cat.term_prefix == "color-"
+    assert cat.term_suffix is None
+    assert cat.matches_open_pattern("color-teal") is True
+    assert cat.matches_open_pattern("color-") is False  # empty body
+    assert cat.matches_open_pattern("red") is False
+    assert cat.matches_open_pattern("color-red") is True
+
+
+def test_parse_open_category_suffix_only():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: language
+    mode: zero-or-one
+    open: true
+    term_suffix: "-lang"
+""")
+    cat = tl.categories[0]
+    assert cat.matches_open_pattern("python-lang") is True
+    assert cat.matches_open_pattern("lang") is False
+    assert cat.matches_open_pattern("python") is False
+
+
+def test_parse_open_requires_affix():
+    with pytest.raises(ParseError, match="require at least one of 'term_prefix' or 'term_suffix'"):
+        parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: x
+    mode: zero-or-more
+    open: true
+""")
+
+
+def test_parse_affix_without_open():
+    with pytest.raises(ParseError, match="only apply when 'open: true'"):
+        parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: x
+    mode: zero-or-more
+    term_prefix: "x-"
+    terms:
+      - term: x-a
+""")
+
+
+def test_parse_open_category_empty_terms_ok():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: color
+    mode: zero-or-more
+    open: true
+    term_prefix: "color-"
+""")
+    assert tl.categories[0].terms == []
+
+
+def test_assign_term_closed_wins_over_open():
+    # "color-red" is a closed term in category A; category B has open prefix "color-".
+    # Closed match wins.
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: prominent
+    mode: zero-or-more
+    terms:
+      - term: color-red
+  - name: palette
+    mode: zero-or-more
+    open: true
+    term_prefix: "color-"
+""")
+    cat = tl.assign_term_to_category("color-red")
+    assert cat is not None
+    assert cat.name == "prominent"
+
+    # An open-only term resolves to the open category.
+    cat2 = tl.assign_term_to_category("color-teal")
+    assert cat2 is not None
+    assert cat2.name == "palette"
+
+    # Unrelated term → None.
+    assert tl.assign_term_to_category("banana") is None
+
+
+def test_assign_longest_affix_wins_among_open():
+    tl = parse("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: broad
+    mode: zero-or-more
+    open: true
+    term_prefix: "x-"
+  - name: narrow
+    mode: zero-or-more
+    open: true
+    term_prefix: "x-y-"
+""")
+    cat = tl.assign_term_to_category("x-y-apple")
+    assert cat is not None
+    assert cat.name == "narrow"

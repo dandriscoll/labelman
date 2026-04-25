@@ -74,7 +74,8 @@ def test_resolve_script_custom_ignores_endpoint():
 
 
 def test_resolve_script_none_config():
-    with pytest.raises(ValueError, match="not configured"):
+    from labelman.errors import IntegrationError
+    with pytest.raises(IntegrationError, match="not configured"):
         resolve_script("clip", None)
 
 
