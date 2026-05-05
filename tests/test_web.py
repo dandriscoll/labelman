@@ -620,3 +620,111 @@ def test_cli_ui_defaults():
     args = parser.parse_args(["ui"])
     assert args.port == 7933
     assert args.host == "0.0.0.0"
+    assert args.markback is False
+
+
+# --- Markback (.mb) format ---
+
+def test_cli_ui_markback_flag():
+    from labelman.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["ui", "--markback"])
+    assert args.markback is True
+
+
+def test_index_set_labels_markback(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    idx = ImageIndex(tmp_path, markback=True)
+    assert idx.set_labels("photo.jpg", ["outdoor", "single"])
+    # Markback sidecar created; .txt sidecar must NOT exist.
+    assert (tmp_path / "photo.labels.mb").exists()
+    assert not (tmp_path / "photo.labels.txt").exists()
+    assert idx.get_labels("photo.jpg") == ["outdoor", "single"]
+
+
+def test_put_labels_markback(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    srv, port = start_server_background(tmp_path, markback=True)
+    conn = HTTPConnection("127.0.0.1", port)
+    try:
+        status, data = _put_json(conn, "/api/images/photo.jpg/labels", {
+            "labels": ["outdoor", "single"]
+        })
+        assert status == 200
+        sidecar = tmp_path / "photo.labels.mb"
+        assert sidecar.exists()
+        assert "<<<" in sidecar.read_text()
+        assert "outdoor; single" in sidecar.read_text()
+        assert not (tmp_path / "photo.labels.txt").exists()
+    finally:
+        srv.shutdown()
+        conn.close()
+
+
+def test_apply_markback(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "labelman.yaml").write_text("""\
+defaults:
+  threshold: 0.3
+categories:
+  - name: setting
+    mode: exactly-one
+    terms:
+      - term: outdoor
+""")
+    (tmp_path / "photo.labels.mb").write_text("<<< outdoor\n")
+    srv, port = start_server_background(tmp_path, markback=True)
+    conn = HTTPConnection("127.0.0.1", port)
+    try:
+        status, data = _post_json(conn, "/api/images/photo.jpg/apply", {})
+        assert status == 200
+        # Final sidecar in markback form, not .txt.
+        assert (tmp_path / "photo.mb").exists()
+        assert not (tmp_path / "photo.txt").exists()
+        text = (tmp_path / "photo.mb").read_text()
+        assert "outdoor" in text
+        assert "<<<" in text
+    finally:
+        srv.shutdown()
+        conn.close()
+
+
+def test_delete_markback_removes_mb_sidecars(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "photo.labels.mb").write_text("<<< x\n")
+    (tmp_path / "photo.detected.mb").write_text("<<< y\n")
+    (tmp_path / "photo.mb").write_text("<<< z\n")
+    srv, port = start_server_background(tmp_path, markback=True)
+    conn = HTTPConnection("127.0.0.1", port)
+    try:
+        conn.request("DELETE", "/api/images/photo.jpg")
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 200
+        for suffix in (".labels.mb", ".detected.mb", ".mb", ".jpg"):
+            assert not (tmp_path / f"photo{suffix}").exists()
+    finally:
+        srv.shutdown()
+        conn.close()
+
+
+def test_html_labels_swapped_in_markback(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    srv, port = start_server_background(tmp_path, markback=True)
+    conn = HTTPConnection("127.0.0.1", port)
+    try:
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        assert ".labels.mb" in body
+        assert ".detected.mb" in body
+        assert ".labels.txt" not in body
+        assert ".detected.txt" not in body
+    finally:
+        srv.shutdown()
+        conn.close()

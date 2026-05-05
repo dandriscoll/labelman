@@ -14,7 +14,16 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .errors import UIServerError
-from .label import load_manual_sidecar, merge_sidecars, write_final_sidecar
+from .label import (
+    MB_FORMAT,
+    TXT_FORMAT,
+    SidecarFormat,
+    load_detected_sidecar as _label_load_detected_sidecar,
+    load_manual_sidecar,
+    merge_sidecars,
+    write_final_sidecar,
+    write_manual_sidecar as _label_write_manual_sidecar,
+)
 from .schema import ParseError, TermList, parse
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
@@ -35,8 +44,9 @@ MAX_REQUEST_BODY = 1_048_576  # 1 MB
 class ImageIndex:
     """Scans a directory for images and provides paginated access."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, markback: bool = False):
         self.directory = directory.resolve()
+        self.fmt: SidecarFormat = MB_FORMAT if markback else TXT_FORMAT
         self._images: list[str] = []
         self._taxonomy: dict | None = None
         self._term_list: TermList | None = None
@@ -126,22 +136,22 @@ class ImageIndex:
         items = []
         for name in names:
             path = self.directory / name
-            manual = load_manual_sidecar(str(path))
-            detected = load_detected_sidecar(path)
+            manual = load_manual_sidecar(str(path), fmt=self.fmt)
+            detected = _label_load_detected_sidecar(path, fmt=self.fmt)
             total_labels = len(manual) + len(detected)
             items.append({
                 "name": name,
                 "has_labels": total_labels > 0,
-                "has_labels_file": (path.with_suffix(".labels.txt")).is_file(),
+                "has_labels_file": path.with_suffix(self.fmt.manual_suffix).is_file(),
                 "label_count": total_labels,
             })
         return items, total
 
     def _has_labels_file(self, name: str) -> bool:
-        return (self.directory / name).with_suffix(".labels.txt").is_file()
+        return (self.directory / name).with_suffix(self.fmt.manual_suffix).is_file()
 
     def find_next_unlabeled(self, after: str | None = None) -> str | None:
-        """Find next image without a .labels.txt file, starting after the given name."""
+        """Find next image without a manual-labels sidecar, starting after the given name."""
         start = 0
         if after:
             try:
@@ -174,49 +184,30 @@ class ImageIndex:
         path = self.resolve_image(name)
         if path is None:
             return None
-        return load_manual_sidecar(str(path))
+        return load_manual_sidecar(str(path), fmt=self.fmt)
 
     def get_detected_labels(self, name: str) -> list[str] | None:
         path = self.resolve_image(name)
         if path is None:
             return None
-        return load_detected_sidecar(path)
+        return _label_load_detected_sidecar(path, fmt=self.fmt)
 
     def set_labels(self, name: str, labels: list[str]) -> bool:
         path = self.resolve_image(name)
         if path is None:
             return False
-        write_manual_sidecar(path, labels)
+        _label_write_manual_sidecar(path, labels, fmt=self.fmt)
         return True
 
 
+# Back-compat re-exports — older callers (and tests) imported these from
+# labelman.web. The TXT_FORMAT defaults preserve their original behavior.
 def write_manual_sidecar(image_path: Path, labels: list[str]) -> Path:
-    """Write manual labels to a .labels.txt sidecar file.
-
-    Format matches what load_manual_sidecar expects: comma-separated.
-    """
-    sidecar = image_path.with_suffix(".labels.txt")
-    if labels:
-        sidecar.write_text(", ".join(labels))
-    else:
-        if sidecar.exists():
-            sidecar.write_text("")
-    return sidecar
+    return _label_write_manual_sidecar(image_path, labels, fmt=TXT_FORMAT)
 
 
 def load_detected_sidecar(image_path: Path) -> list[str]:
-    """Load detected labels from a .detected.txt sidecar (comma-separated caption format).
-
-    These are the output of 'labelman label' or 'labelman suggest --txt'.
-    Returns an empty list if no sidecar exists.
-    """
-    sidecar = image_path.with_suffix(".detected.txt")
-    if not sidecar.is_file():
-        return []
-    text = sidecar.read_text().strip()
-    if not text:
-        return []
-    return [label.strip() for label in text.split(",") if label.strip()]
+    return _label_load_detected_sidecar(image_path, fmt=TXT_FORMAT)
 
 
 class LabelmanHandler(BaseHTTPRequestHandler):
@@ -339,7 +330,16 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             self._send_error(404, "Not found")
 
     def _serve_html(self) -> None:
-        body = _HTML.encode()
+        if self.index.fmt is MB_FORMAT:
+            html = (_HTML
+                    .replace(".labels.txt", ".labels.mb")
+                    .replace(".detected.txt", ".detected.mb")
+                    .replace("(.txt)", "(.mb)")
+                    .replace("to .txt on", "to .mb on")
+                    .replace("to .txt for", "to .mb for"))
+        else:
+            html = _HTML
+        body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -399,17 +399,18 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             self._send_error(404, "Image not found")
             return
 
-        # Apply suppressions to the .detected.txt sidecar
+        # Apply suppressions to the detected sidecar
         suppressions = {l[1:] for l in labels if l.startswith("-")}
         if suppressions:
             path = self.index.resolve_image(name)
             if path is not None:
-                sidecar = path.with_suffix(".detected.txt")
+                fmt = self.index.fmt
+                sidecar = path.with_suffix(fmt.detected_suffix)
                 if sidecar.is_file():
-                    detected = load_detected_sidecar(path)
+                    detected = _label_load_detected_sidecar(path, fmt=fmt)
                     filtered = [l for l in detected if l not in suppressions]
                     if filtered != detected:
-                        sidecar.write_text(", ".join(filtered) if filtered else "")
+                        sidecar.write_text(fmt.encode(filtered))
 
         self._send_json({"name": name, "manual_labels": labels})
 
@@ -419,11 +420,10 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             self._send_error(404, "Image not found")
             return
         # Remove image and associated sidecars
-        manual_sidecar = path.with_suffix(".labels.txt")
-        detected_sidecar = path.with_suffix(".detected.txt")
-        final_sidecar = path.with_suffix(".txt")
+        fmt = self.index.fmt
         path.unlink()
-        for sc in (manual_sidecar, detected_sidecar, final_sidecar):
+        for suffix in (fmt.manual_suffix, fmt.detected_suffix, fmt.final_suffix):
+            sc = path.with_suffix(suffix)
             if sc.is_file():
                 sc.unlink()
         self.index.refresh()
@@ -441,7 +441,7 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         if path is None:
             self._send_error(404, "Image not found")
             return
-        sidecar = path.with_suffix(".detected.txt")
+        sidecar = path.with_suffix(self.index.fmt.detected_suffix)
         sidecar.write_text(text)
         self._send_json({"name": name, "text": text})
 
@@ -491,8 +491,9 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         if term_list is None:
             self._send_error(400, "No labelman.yaml found")
             return
-        merged = merge_sidecars(term_list, str(path))
-        sidecar = write_final_sidecar(str(path), merged)
+        fmt = self.index.fmt
+        merged = merge_sidecars(term_list, str(path), fmt=fmt)
+        sidecar = write_final_sidecar(str(path), merged, fmt=fmt)
         self._send_json({"name": name, "final": merged, "path": str(sidecar)})
 
     def _handle_apply_all(self) -> None:
@@ -501,11 +502,12 @@ class LabelmanHandler(BaseHTTPRequestHandler):
         if term_list is None:
             self._send_error(400, "No labelman.yaml found")
             return
+        fmt = self.index.fmt
         results = []
         for img_name in self.index._images:
             path = self.index.directory / img_name
-            merged = merge_sidecars(term_list, str(path))
-            write_final_sidecar(str(path), merged)
+            merged = merge_sidecars(term_list, str(path), fmt=fmt)
+            write_final_sidecar(str(path), merged, fmt=fmt)
             results.append({"name": img_name, "label_count": len(merged)})
         self._send_json({"applied": len(results), "results": results})
 
@@ -626,8 +628,9 @@ class LabelmanHandler(BaseHTTPRequestHandler):
 
             result.save(new_path, **save_kwargs)
 
-            # Copy all .txt sidecar files
-            for suffix in (".labels.txt", ".detected.txt", ".txt"):
+            # Copy all sidecar files in the active format
+            fmt = self.index.fmt
+            for suffix in (fmt.manual_suffix, fmt.detected_suffix, fmt.final_suffix):
                 sidecar = path.with_suffix(suffix)
                 if sidecar.is_file():
                     new_sidecar = new_path.with_suffix(suffix)
@@ -660,9 +663,10 @@ def _get_display_host(host: str) -> str:
     return host
 
 
-def serve(directory: Path, host: str = "0.0.0.0", port: int = 0) -> None:
+def serve(directory: Path, host: str = "0.0.0.0", port: int = 0,
+          markback: bool = False) -> None:
     """Start the labeling web interface."""
-    index = ImageIndex(directory)
+    index = ImageIndex(directory, markback=markback)
 
     handler_class = type(
         "BoundHandler",
@@ -695,7 +699,8 @@ def serve(directory: Path, host: str = "0.0.0.0", port: int = 0) -> None:
     actual_port = server.server_address[1]
     display_host = _get_display_host(host)
     print(f"Labeling UI: http://{display_host}:{actual_port}")
-    print(f"Dataset: {directory} ({index.total} images)")
+    fmt_label = "markback (.mb)" if markback else "txt (.txt)"
+    print(f"Dataset: {directory} ({index.total} images, format: {fmt_label})")
     print("Press Ctrl+C to stop")
     try:
         server.serve_forever()
@@ -704,12 +709,13 @@ def serve(directory: Path, host: str = "0.0.0.0", port: int = 0) -> None:
         server.shutdown()
 
 
-def start_server_background(directory: Path, host: str = "127.0.0.1", port: int = 0) -> tuple[HTTPServer, int]:
+def start_server_background(directory: Path, host: str = "127.0.0.1", port: int = 0,
+                            markback: bool = False) -> tuple[HTTPServer, int]:
     """Start the server in a background thread (for testing).
 
     Returns (server, port).
     """
-    index = ImageIndex(directory)
+    index = ImageIndex(directory, markback=markback)
     handler_class = type(
         "BoundHandler",
         (LabelmanHandler,),

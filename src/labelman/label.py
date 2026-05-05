@@ -12,6 +12,51 @@ from pathlib import Path
 from .schema import CategoryMode, TermList
 
 
+@dataclass(frozen=True)
+class SidecarFormat:
+    """Sidecar file format: extensions plus encode/decode for the label list.
+
+    Two formats are supported:
+
+      TXT_FORMAT — labelman's native ``.txt`` family with comma-separated labels.
+      MB_FORMAT  — markback v2 ``.mb`` family. Encoding/decoding goes through
+                   the ``markback`` package so labelman stays compatible with
+                   markback tools that read/write the same files.
+    """
+    final_suffix: str
+    manual_suffix: str
+    detected_suffix: str
+    _flavor: str  # "txt" | "mb" — selects encode/decode path
+
+    def encode(self, labels: list[str]) -> str:
+        if not labels:
+            return ""
+        if self._flavor == "txt":
+            return ", ".join(labels)
+        # markback sidecar form: a single record whose feedback string holds
+        # the semicolon-joined labels. write_label_file emits "<<< …\n".
+        from markback import write_label_file
+        from markback.types import Record
+        return write_label_file(Record(feedback="; ".join(labels)))
+
+    def decode(self, text: str) -> list[str]:
+        text = text.strip()
+        if not text:
+            return []
+        if self._flavor == "txt":
+            return [s.strip() for s in text.split(",") if s.strip()]
+        from markback import parse_string
+        result = parse_string(text)
+        if not result.records:
+            return []
+        feedback = result.records[0].feedback or ""
+        return [s.strip() for s in feedback.split(";") if s.strip()]
+
+
+TXT_FORMAT = SidecarFormat(".txt", ".labels.txt", ".detected.txt", "txt")
+MB_FORMAT = SidecarFormat(".mb", ".labels.mb", ".detected.mb", "mb")
+
+
 @dataclass
 class ImageLabels:
     image: str
@@ -72,21 +117,33 @@ def apply_vlm_labels(term_list: TermList, image: str, vlm_labels: dict[str, list
     return ImageLabels(image=image, labels=vlm_labels, all_scores={})
 
 
-def load_manual_sidecar(image_path: str) -> list[str]:
-    """Load manual labels from a .labels.txt sidecar file if it exists.
+def load_manual_sidecar(image_path: str, fmt: SidecarFormat = TXT_FORMAT) -> list[str]:
+    """Load manual labels from a manual sidecar file if it exists.
 
-    Sidecar naming: for image_001.jpg, the sidecar is image_001.labels.txt.
-    Format: comma-separated labels, whitespace-trimmed, empty entries ignored.
-    Returns an empty list if no sidecar exists.
+    For image_001.jpg the sidecar is image_001<manual_suffix>. Returns an
+    empty list if the file is missing or empty.
     """
     p = Path(image_path)
-    sidecar = p.with_suffix(".labels.txt")
+    sidecar = p.with_suffix(fmt.manual_suffix)
     if not sidecar.is_file():
         return []
-    text = sidecar.read_text().strip()
-    if not text:
-        return []
-    return [label.strip() for label in text.split(",") if label.strip()]
+    return fmt.decode(sidecar.read_text())
+
+
+def write_manual_sidecar(image_path: Path, labels: list[str],
+                         fmt: SidecarFormat = TXT_FORMAT) -> Path:
+    """Write manual labels to the manual sidecar for an image.
+
+    Non-empty labels write the encoded form. Empty labels truncate an
+    existing sidecar but do not create one — the UI relies on sidecar
+    existence to mean "user has touched this image".
+    """
+    sidecar = image_path.with_suffix(fmt.manual_suffix)
+    if labels:
+        sidecar.write_text(fmt.encode(labels))
+    elif sidecar.exists():
+        sidecar.write_text("")
+    return sidecar
 
 
 def assemble_final_labels(
@@ -195,43 +252,45 @@ def detected_to_caption(result: ImageLabels) -> str:
     return ", ".join(terms)
 
 
-def write_sidecar(result: ImageLabels, output_dir: Path | None = None) -> Path:
-    """Write a .detected.txt sidecar file with detected category labels for an image.
+def write_sidecar(result: ImageLabels, output_dir: Path | None = None,
+                  fmt: SidecarFormat = TXT_FORMAT) -> Path:
+    """Write a detected sidecar file with detected category labels for an image.
 
-    Only writes labels from category detection (CLIP scores).
+    Only writes labels from category detection (CLIP/VLM scores).
     Global terms and manual labels are merged at apply time.
     """
     image_path = Path(result.image)
     if output_dir is not None:
-        sidecar = output_dir / (image_path.stem + ".detected.txt")
+        sidecar = output_dir / (image_path.stem + fmt.detected_suffix)
     else:
-        sidecar = image_path.with_suffix(".detected.txt")
+        sidecar = image_path.with_suffix(fmt.detected_suffix)
     sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(detected_to_caption(result))
+    detected_terms: list[str] = []
+    for cat_terms in result.labels.values():
+        detected_terms.extend(cat_terms)
+    sidecar.write_text(fmt.encode(detected_terms))
     return sidecar
 
 
-def load_detected_sidecar(image_path: str) -> list[str]:
-    """Load detected labels from a .detected.txt sidecar file if it exists.
+def load_detected_sidecar(image_path: str | Path,
+                          fmt: SidecarFormat = TXT_FORMAT) -> list[str]:
+    """Load detected labels from a detected sidecar file if it exists.
 
-    Format: comma-separated labels, whitespace-trimmed, empty entries ignored.
     Returns an empty list if no sidecar exists.
     """
     p = Path(image_path)
-    sidecar = p.with_suffix(".detected.txt")
+    sidecar = p.with_suffix(fmt.detected_suffix)
     if not sidecar.is_file():
         return []
-    text = sidecar.read_text().strip()
-    if not text:
-        return []
-    return [label.strip() for label in text.split(",") if label.strip()]
+    return fmt.decode(sidecar.read_text())
 
 
 def merge_sidecars(
     term_list: TermList,
     image_path: str,
+    fmt: SidecarFormat = TXT_FORMAT,
 ) -> list[str]:
-    """Merge manual (.labels.txt) and detected (.detected.txt) into final labels.
+    """Merge manual and detected sidecars into final labels.
 
     Applies the same merge logic as assemble_final_labels:
       1. global_terms (from labelman.yaml)
@@ -239,8 +298,8 @@ def merge_sidecars(
       3. detected labels
     Minus explicit suppressions (-term) and implicit exclusive-category suppressions.
     """
-    manual_labels = load_manual_sidecar(image_path)
-    detected_labels = load_detected_sidecar(image_path)
+    manual_labels = load_manual_sidecar(image_path, fmt=fmt)
+    detected_labels = load_detected_sidecar(image_path, fmt=fmt)
 
     # Separate suppression directives from additive manual labels
     suppressions: set[str] = set()
@@ -273,15 +332,17 @@ def merge_sidecars(
     return merged
 
 
-def write_final_sidecar(image_path: str, labels: list[str], output_dir: Path | None = None) -> Path:
-    """Write the final merged .txt sidecar for an image."""
+def write_final_sidecar(image_path: str, labels: list[str],
+                        output_dir: Path | None = None,
+                        fmt: SidecarFormat = TXT_FORMAT) -> Path:
+    """Write the final merged sidecar for an image."""
     p = Path(image_path)
     if output_dir is not None:
-        sidecar = output_dir / (p.stem + ".txt")
+        sidecar = output_dir / (p.stem + fmt.final_suffix)
     else:
-        sidecar = p.with_suffix(".txt")
+        sidecar = p.with_suffix(fmt.final_suffix)
     sidecar.parent.mkdir(parents=True, exist_ok=True)
-    sidecar.write_text(", ".join(labels))
+    sidecar.write_text(fmt.encode(labels))
     return sidecar
 
 

@@ -515,7 +515,40 @@ def cmd_ui(args: argparse.Namespace) -> int:
         print(f"Error: {images_path} is not a directory", file=sys.stderr)
         return 1
 
-    web_serve(images_path, host=args.host, port=args.port)
+    web_serve(images_path, host=args.host, port=args.port,
+              markback=args.markback)
+    return 0
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    from .build import build_yaml
+
+    images_path = Path(args.images)
+    if not images_path.is_dir():
+        print(f"Error: {images_path} is not a directory", file=sys.stderr)
+        return 1
+
+    config_path = images_path / DEFAULT_CONFIG
+    if config_path.exists() and not args.force:
+        print(f"Error: {config_path} already exists (use --force to overwrite)",
+              file=sys.stderr)
+        return 1
+
+    yaml_text, terms, files_scanned = build_yaml(images_path)
+    if not terms:
+        print(f"Error: no labels found in {images_path} "
+              f"(looked for *.txt and *.mb final-label sidecars)",
+              file=sys.stderr)
+        return 1
+
+    # Defense in depth: parse what we just generated. parse() raises
+    # ParseError (a LabelmanError) on failure, which the top-level handler
+    # surfaces cleanly.
+    parse(yaml_text)
+
+    config_path.write_text(yaml_text)
+    print(f"Wrote {config_path}: {len(terms)} unique term(s) from "
+          f"{files_scanned} sidecar file(s)")
     return 0
 
 
@@ -649,6 +682,15 @@ def build_parser() -> argparse.ArgumentParser:
     ui_p.add_argument("--images", default=".", help="Directory containing images")
     ui_p.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
     ui_p.add_argument("--port", type=int, default=7933, help="Port to bind to (default: 7933)")
+    ui_p.add_argument("--markback", action="store_true",
+                      help="Read/write sidecars as markback v2 (.mb / .labels.mb / "
+                           ".detected.mb with ';' separator) instead of .txt with ','")
+
+    # build
+    build_p = sub.add_parser("build", help="Generate labelman.yaml from existing .txt/.mb sidecars")
+    build_p.add_argument("--images", default=".", help="Directory containing images and sidecars")
+    build_p.add_argument("--force", action="store_true",
+                         help="Overwrite an existing labelman.yaml")
 
     # rename
     rename_p = sub.add_parser("rename", help="Rename a term across config and sidecar files")
@@ -705,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
         "apply": cmd_apply,
         "rename": cmd_rename,
         "ui": cmd_ui,
+        "build": cmd_build,
         "descriptor": cmd_descriptor,
         "test-endpoints": cmd_test_endpoints,
     }

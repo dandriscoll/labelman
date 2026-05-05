@@ -3,13 +3,17 @@
 import csv
 
 from labelman.label import (
+    MB_FORMAT,
+    TXT_FORMAT,
     apply_labels,
     assemble_final_labels,
     labels_to_caption,
+    load_detected_sidecar,
     load_manual_sidecar,
     merge_sidecars,
     write_csv,
     write_final_sidecar,
+    write_manual_sidecar,
     write_report,
     write_sidecar,
 )
@@ -396,6 +400,118 @@ def test_write_final_sidecar_output_dir(tmp_path):
     sidecar = write_final_sidecar("/data/images/photo.jpg", ["aircraft"], output_dir=out_dir)
     assert sidecar == out_dir / "photo.txt"
     assert sidecar.read_text() == "aircraft"
+
+
+# --- Markback (.mb) sidecar format ---
+
+def test_mb_format_encode_decode_round_trip():
+    labels = ["outdoor", "single", "calm"]
+    encoded = MB_FORMAT.encode(labels)
+    # Markback sidecar form: leading "<<<" delimits feedback in V1 paired mode.
+    assert "<<<" in encoded
+    assert "outdoor; single; calm" in encoded
+    assert MB_FORMAT.decode(encoded) == labels
+
+
+def test_mb_format_encode_empty_returns_empty_string():
+    assert MB_FORMAT.encode([]) == ""
+    assert MB_FORMAT.decode("") == []
+
+
+def test_mb_format_decode_strips_whitespace():
+    text = "<<< outdoor ;  single  ; calm \n"
+    assert MB_FORMAT.decode(text) == ["outdoor", "single", "calm"]
+
+
+def test_txt_format_encode_decode_round_trip():
+    labels = ["outdoor", "single", "calm"]
+    assert TXT_FORMAT.encode(labels) == "outdoor, single, calm"
+    assert TXT_FORMAT.decode(TXT_FORMAT.encode(labels)) == labels
+
+
+def test_load_manual_sidecar_mb(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "photo.labels.mb").write_text("<<< outdoor; single; calm\n")
+    assert load_manual_sidecar(str(img), fmt=MB_FORMAT) == ["outdoor", "single", "calm"]
+
+
+def test_load_manual_sidecar_mb_does_not_read_txt(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "photo.labels.txt").write_text("outdoor, single")
+    assert load_manual_sidecar(str(img), fmt=MB_FORMAT) == []
+
+
+def test_write_manual_sidecar_mb(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    sidecar = write_manual_sidecar(img, ["outdoor", "single"], fmt=MB_FORMAT)
+    assert sidecar.name == "photo.labels.mb"
+    text = sidecar.read_text()
+    assert "<<<" in text
+    assert "outdoor; single" in text
+    # Round-trips
+    assert load_manual_sidecar(str(img), fmt=MB_FORMAT) == ["outdoor", "single"]
+
+
+def test_write_manual_sidecar_mb_empty_does_not_create(tmp_path):
+    """Empty labels must not create a new sidecar — UI uses existence as 'touched'."""
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    write_manual_sidecar(img, [], fmt=MB_FORMAT)
+    assert not (tmp_path / "photo.labels.mb").exists()
+
+
+def test_write_manual_sidecar_mb_empty_truncates_existing(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    write_manual_sidecar(img, ["x"], fmt=MB_FORMAT)
+    write_manual_sidecar(img, [], fmt=MB_FORMAT)
+    sidecar = tmp_path / "photo.labels.mb"
+    assert sidecar.exists()
+    assert sidecar.read_text() == ""
+
+
+def test_write_final_sidecar_mb(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    sidecar = write_final_sidecar(str(img), ["aircraft", "single"], fmt=MB_FORMAT)
+    assert sidecar.name == "photo.mb"
+    assert MB_FORMAT.decode(sidecar.read_text()) == ["aircraft", "single"]
+
+
+def test_load_detected_sidecar_mb(tmp_path):
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "photo.detected.mb").write_text("<<< single; calm\n")
+    assert load_detected_sidecar(img, fmt=MB_FORMAT) == ["single", "calm"]
+
+
+def test_merge_sidecars_mb(tmp_path):
+    yaml_str = """\
+defaults:
+  threshold: 0.3
+categories:
+  - name: count
+    mode: exactly-one
+    terms:
+      - term: single
+      - term: group
+  - name: mood
+    mode: zero-or-more
+    terms:
+      - term: calm
+"""
+    tl = parse(yaml_str)
+    img = tmp_path / "photo.jpg"
+    img.write_bytes(b"\xff\xd8")
+    (tmp_path / "photo.detected.mb").write_text("<<< single; calm\n")
+    (tmp_path / "photo.labels.mb").write_text("<<< custom-tag\n")
+    merged = merge_sidecars(tl, str(img), fmt=MB_FORMAT)
+    assert "custom-tag" in merged
+    assert "single" in merged
+    assert "calm" in merged
 
 
 # --- Final label assembly ---
