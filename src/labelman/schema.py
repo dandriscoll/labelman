@@ -322,20 +322,16 @@ def parse(source: str | Path) -> TermList:
                 else:
                     global_terms_list.append(item.strip())
 
-    # --- categories ---
-    if "categories" not in data:
-        errors.append("Missing required key: 'categories'")
-        categories_list = []
-    else:
+    # --- categories (optional when global_terms are present) ---
+    # A taxonomy may consist solely of global_terms, so categories may be
+    # missing or empty. The "config must do something" guarantee is enforced
+    # by the cross-check below, not by requiring categories here.
+    categories_list = []
+    if "categories" in data:
         cats_raw = data["categories"]
         if not isinstance(cats_raw, list):
             errors.append("'categories' must be a list")
-            categories_list = []
-        elif len(cats_raw) == 0:
-            errors.append("'categories' must not be empty")
-            categories_list = []
         else:
-            categories_list = []
             seen_cat_names: set[str] = set()
 
             for i, cat_raw in enumerate(cats_raw):
@@ -539,6 +535,13 @@ def parse(source: str | Path) -> TermList:
                             term_suffix=cat_suffix,
                         )
                     )
+
+    # A config must label something: at least one category or one global term.
+    if not categories_list and not global_terms_list:
+        errors.append(
+            "Config defines no categories and no global_terms — nothing to label. "
+            "Add at least one category or a 'global_terms' entry."
+        )
 
     if errors:
         raise ParseError(errors)

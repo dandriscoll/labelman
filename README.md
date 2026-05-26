@@ -87,6 +87,12 @@ categories:
         threshold: 0.25
 ```
 
+`categories` is optional: a config may define only `global_terms` (applied to
+every image), in which case `categories` can be omitted or left empty. A config
+must define at least one of `categories` or `global_terms`. With no categories,
+`labelman label` applies the global terms to every image without calling any
+integration.
+
 ### Sidecar files
 
 Per-image text files with comma-separated labels:
@@ -124,6 +130,18 @@ Merge `.labels.txt` (manual) + `.detected.txt` (detected) into final `.txt` side
 ### `labelman rename --old TERM --new TERM [--config PATH] [--dry-run]`
 
 Rename a term across `labelman.yaml` and all sidecar files (`.labels.txt`, `.detected.txt`, `.txt`) in the config's directory. Use `--dry-run` to preview changes.
+
+### `labelman terms [--images DIR] [--output FILE]`
+
+Scan the final-label sidecars (`.txt`/`.mb`, excluding intermediate `.labels.*`/`.detected.*`) in a directory and write a frequency-sorted list of the labels used across the corpus. Each line is `<count> <label>`, sorted by count descending then label ascending:
+
+```
+102 outdoor
+95 single
+12 calm
+```
+
+Output defaults to `terms.txt` in the images directory; use `--output` to write elsewhere.
 
 ### `labelman ui [--images DIR] [--host HOST] [--port PORT]`
 
@@ -183,6 +201,7 @@ labelman is a bulk image labeling CLI tool (Python 3.10+, PyYAML). The canonical
 - `labelman label --images DIR` -- score images with CLIP, write .detected.txt sidecars
 - `labelman apply --images DIR` -- merge manual + detected into final .txt sidecars
 - `labelman rename --old TERM --new TERM [--dry-run]` -- rename a term across config and all sidecars
+- `labelman terms --images DIR [--output FILE]` -- frequency-sorted list of labels used across the corpus (default: terms.txt)
 - `labelman ui --images DIR` -- web UI for manual labeling (port 7933)
 
 ### File layout

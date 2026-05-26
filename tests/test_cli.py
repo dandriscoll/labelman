@@ -281,7 +281,11 @@ def test_cli_label_quiet(mock_clip, tmp_path, capsys):
     assert (images_dir / "labels.csv").exists()
 
 
-def test_cli_label_no_terms(tmp_path, capsys):
+def test_cli_label_question_only_requires_provider(tmp_path, capsys):
+    # A question-only category has no closed terms but is still labelable via a
+    # provider (the VLM answers the question). It must NOT be rejected as
+    # "nothing to label"; with no integration configured it errors on the
+    # missing provider config instead.
     config_path = tmp_path / "labelman.yaml"
     config_path.write_text("""\
 defaults:
@@ -297,7 +301,34 @@ categories:
     result = main(["label", "--images", str(images_dir), "--config", str(config_path)])
     assert result == 1
     captured = capsys.readouterr()
-    assert "no terms" in captured.err
+    assert "requires integrations.clip" in captured.err
+
+
+def test_cli_label_global_terms_only(tmp_path, capsys):
+    # Global-terms-only config (no categories): label applies the global terms
+    # to every image with no provider and no network call.
+    config_path = tmp_path / "labelman.yaml"
+    config_path.write_text("""\
+defaults:
+  threshold: 0.3
+global_terms:
+  - aircraft
+  - mooney m20
+""")
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    (images_dir / "img1.jpg").write_text("")
+    (images_dir / "img2.jpg").write_text("")
+    result = main(["label", "--images", str(images_dir), "--config", str(config_path)])
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "global terms only" in out
+    # Final labels (after apply) carry the global terms on every image.
+    main(["apply", "--images", str(images_dir), "--config", str(config_path)])
+    for name in ("img1.txt", "img2.txt"):
+        content = (images_dir / name).read_text()
+        assert "aircraft" in content
+        assert "mooney m20" in content
 
 
 def test_cli_apply(tmp_path, capsys):

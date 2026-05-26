@@ -8,6 +8,7 @@ is its own zero-or-one category. The user clusters from there.
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -44,14 +45,18 @@ def _format_for(suffix: str) -> SidecarFormat | None:
     return None
 
 
-def collect_terms(images_dir: Path) -> tuple[list[str], int]:
-    """Scan images_dir for final-label sidecars and return (sorted_unique_terms, files_scanned).
+def _scan_sidecars(images_dir: Path) -> tuple[list[str], int]:
+    """Scan images_dir's final-label sidecars; return (all_labels, files_scanned).
 
     Reads plain ``*.txt`` and ``*.mb`` files (skipping ``*.labels.*`` and
     ``*.detected.*``). Each file is decoded with the matching SidecarFormat
-    so commas and semicolons are handled correctly per format.
+    so commas and semicolons are handled correctly per format. Labels are
+    yielded per occurrence across files (no dedupe) so callers can either
+    collapse to a set or tally frequencies. Suppression directives ("-foo")
+    are filtered out — they are a manual-sidecar artifact that should not
+    appear in a final sidecar, but we drop them defensively.
     """
-    terms: set[str] = set()
+    labels: list[str] = []
     files_scanned = 0
     for path in sorted(images_dir.iterdir()):
         if not path.is_file():
@@ -63,13 +68,41 @@ def collect_terms(images_dir: Path) -> tuple[list[str], int]:
             continue
         files_scanned += 1
         for label in fmt.decode(path.read_text()):
-            # Suppression directives ("-foo") are an artifact of manual
-            # sidecars; in a final sidecar they should not appear, but
-            # filter defensively just in case.
             if label.startswith("-"):
                 continue
-            terms.add(label)
-    return sorted(terms), files_scanned
+            labels.append(label)
+    return labels, files_scanned
+
+
+def collect_terms(images_dir: Path) -> tuple[list[str], int]:
+    """Scan images_dir for final-label sidecars and return (sorted_unique_terms, files_scanned)."""
+    labels, files_scanned = _scan_sidecars(images_dir)
+    return sorted(set(labels)), files_scanned
+
+
+def count_terms(images_dir: Path) -> tuple[Counter[str], int]:
+    """Scan images_dir for final-label sidecars and return (label_counts, files_scanned).
+
+    The Counter maps each label to the number of sidecar files it appears in.
+    A label is decoded at most once per file (sidecars do not repeat a label),
+    so the count is effectively "how many images carry this label".
+    """
+    labels, files_scanned = _scan_sidecars(images_dir)
+    return Counter(labels), files_scanned
+
+
+def render_terms(counts: Counter[str]) -> str:
+    """Render label frequencies as ``"<count> <label>"`` lines.
+
+    Sorted by count descending, then label ascending for a stable, readable
+    ordering. Returns a trailing-newline-terminated string (empty string when
+    there are no labels).
+    """
+    lines = [
+        f"{count} {label}"
+        for label, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return "".join(f"{line}\n" for line in lines)
 
 
 def render_yaml(terms: list[str]) -> str:

@@ -405,27 +405,33 @@ def cmd_label(args: argparse.Namespace) -> int:
     quiet = args.quiet
     term_list = parse(config_path)
 
-    # Check that there are terms to label with
     total_terms = sum(len(c.terms) for c in term_list.categories)
-    if total_terms == 0:
-        print("Error: no terms defined in any category — nothing to label", file=sys.stderr)
-        return 1
-
-    provider = _resolve_provider(args, term_list)
-
-    # Validate provider config
-    if provider == "qwen_vl" and term_list.integrations.qwen_vl is None:
-        print("Error: --provider qwen_vl requires integrations.qwen_vl in labelman.yaml", file=sys.stderr)
-        return 1
-    if provider == "clip" and term_list.integrations.clip is None:
-        print("Error: --provider clip requires integrations.clip in labelman.yaml", file=sys.stderr)
-        return 1
-
     num_images = len(image_paths)
     num_cats = len(term_list.categories)
+
+    # Global-terms-only mode: no categories means there is nothing to score,
+    # so we skip the provider entirely and just apply global + manual labels.
+    # parse() guarantees global_terms is non-empty when categories is empty.
+    global_only = num_cats == 0
+    provider = None
+    if not global_only:
+        provider = _resolve_provider(args, term_list)
+
+        # Validate provider config
+        if provider == "qwen_vl" and term_list.integrations.qwen_vl is None:
+            print("Error: --provider qwen_vl requires integrations.qwen_vl in labelman.yaml", file=sys.stderr)
+            return 1
+        if provider == "clip" and term_list.integrations.clip is None:
+            print("Error: --provider clip requires integrations.clip in labelman.yaml", file=sys.stderr)
+            return 1
+
     if not quiet:
-        print(f"Labeling {num_images} images against {total_terms} terms in {num_cats} categories "
-              f"(provider: {provider})...", flush=True)
+        if global_only:
+            print(f"Labeling {num_images} images with {len(term_list.global_terms)} global term(s) "
+                  f"(no categories — global terms only)...", flush=True)
+        else:
+            print(f"Labeling {num_images} images against {total_terms} terms in {num_cats} categories "
+                  f"(provider: {provider})...", flush=True)
 
     # Determine output directory
     output_dir = Path(args.output) if args.output else images_path
@@ -437,7 +443,12 @@ def cmd_label(args: argparse.Namespace) -> int:
         name = Path(image_path).name
 
         try:
-            if provider == "qwen_vl":
+            if global_only:
+                manual = load_manual_sidecar(image_path)
+                result = assemble_final_labels(
+                    term_list, image_path, scores={}, manual_labels=manual,
+                )
+            elif provider == "qwen_vl":
                 vlm_labels = run_qwen_vl(term_list, image_path)
                 manual = load_manual_sidecar(image_path)
                 result = assemble_final_labels(
@@ -548,6 +559,25 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     config_path.write_text(yaml_text)
     print(f"Wrote {config_path}: {len(terms)} unique term(s) from "
+          f"{files_scanned} sidecar file(s)")
+    return 0
+
+
+def cmd_terms(args: argparse.Namespace) -> int:
+    from .build import count_terms, render_terms
+
+    images_path = Path(args.images)
+    if not images_path.is_dir():
+        print(f"Error: {images_path} is not a directory", file=sys.stderr)
+        return 1
+
+    counts, files_scanned = count_terms(images_path)
+
+    output_path = Path(args.output) if args.output else images_path / "terms.txt"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(render_terms(counts))
+
+    print(f"Wrote {output_path}: {len(counts)} unique label(s) from "
           f"{files_scanned} sidecar file(s)")
     return 0
 
@@ -692,6 +722,12 @@ def build_parser() -> argparse.ArgumentParser:
     build_p.add_argument("--force", action="store_true",
                          help="Overwrite an existing labelman.yaml")
 
+    # terms
+    terms_p = sub.add_parser("terms", help="List labels used across the corpus, frequency-sorted")
+    terms_p.add_argument("--images", default=".", help="Directory containing images and sidecars")
+    terms_p.add_argument("--output", default=None,
+                         help="Output file (default: terms.txt in the images directory)")
+
     # rename
     rename_p = sub.add_parser("rename", help="Rename a term across config and sidecar files")
     rename_p.add_argument("old", help="Current term name")
@@ -746,6 +782,7 @@ def main(argv: list[str] | None = None) -> int:
         "label": cmd_label,
         "apply": cmd_apply,
         "rename": cmd_rename,
+        "terms": cmd_terms,
         "ui": cmd_ui,
         "build": cmd_build,
         "descriptor": cmd_descriptor,

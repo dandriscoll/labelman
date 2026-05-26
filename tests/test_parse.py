@@ -171,14 +171,33 @@ def test_parse_missing_threshold():
         parse("defaults: {}\ncategories:\n  - name: a\n    mode: exactly-one\n    terms:\n      - term: x\n")
 
 
-def test_parse_missing_categories():
-    with pytest.raises(ParseError, match="Missing required key: 'categories'"):
+def test_parse_no_categories_no_global_terms_rejected():
+    # A config that defines neither categories nor global_terms does nothing.
+    with pytest.raises(ParseError, match="nothing to label"):
         parse("defaults:\n  threshold: 0.3\n")
 
 
-def test_parse_empty_categories():
-    with pytest.raises(ParseError, match="must not be empty"):
+def test_parse_empty_categories_no_global_terms_rejected():
+    with pytest.raises(ParseError, match="nothing to label"):
         parse("defaults:\n  threshold: 0.3\ncategories: []\n")
+
+
+def test_parse_missing_categories_with_global_terms_ok():
+    # Global-terms-only config: categories key absent is fine.
+    tl = parse("defaults:\n  threshold: 0.3\nglobal_terms:\n  - aircraft\n")
+    assert tl.categories == []
+    assert tl.global_terms == ["aircraft"]
+
+
+def test_parse_empty_categories_with_global_terms_ok():
+    tl = parse("defaults:\n  threshold: 0.3\ncategories: []\nglobal_terms:\n  - aircraft\n")
+    assert tl.categories == []
+    assert tl.global_terms == ["aircraft"]
+
+
+def test_parse_categories_not_a_list_still_errors():
+    with pytest.raises(ParseError, match="'categories' must be a list"):
+        parse("defaults:\n  threshold: 0.3\nglobal_terms:\n  - x\ncategories: foo\n")
 
 
 def test_parse_missing_category_name():
