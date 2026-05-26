@@ -571,9 +571,12 @@ def cmd_terms(args: argparse.Namespace) -> int:
         print(f"Error: {images_path} is not a directory", file=sys.stderr)
         return 1
 
-    counts, files_scanned = count_terms(images_path)
-
     output_path = Path(args.output) if args.output else images_path / "terms.txt"
+
+    # Exclude the output file from the scan so a re-run never ingests its own
+    # previous output (terms.txt is also excluded by reserved-name regardless).
+    counts, files_scanned = count_terms(images_path, exclude=output_path)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(render_terms(counts))
 

@@ -27,6 +27,13 @@ _HEADER_TEMPLATE = """\
 """
 
 
+# Files labelman generates that live alongside images but are NOT label
+# sidecars. The corpus scanner must never ingest these — e.g. `labelman terms`
+# writes terms.txt into the images dir, and a re-run (or a later `build`) would
+# otherwise parse it as a sidecar and corrupt the counts.
+RESERVED_ARTIFACT_NAMES = {"terms.txt"}
+
+
 def _is_intermediate(name: str) -> bool:
     """True for *.labels.<ext> and *.detected.<ext> sidecars."""
     return (
@@ -45,7 +52,7 @@ def _format_for(suffix: str) -> SidecarFormat | None:
     return None
 
 
-def _scan_sidecars(images_dir: Path) -> tuple[list[str], int]:
+def _scan_sidecars(images_dir: Path, exclude: Path | None = None) -> tuple[list[str], int]:
     """Scan images_dir's final-label sidecars; return (all_labels, files_scanned).
 
     Reads plain ``*.txt`` and ``*.mb`` files (skipping ``*.labels.*`` and
@@ -55,13 +62,21 @@ def _scan_sidecars(images_dir: Path) -> tuple[list[str], int]:
     collapse to a set or tally frequencies. Suppression directives ("-foo")
     are filtered out — they are a manual-sidecar artifact that should not
     appear in a final sidecar, but we drop them defensively.
+
+    Reserved labelman artifacts (``terms.txt``) are always skipped, as is
+    ``exclude`` (a specific output file to avoid ingesting on a re-run).
     """
+    exclude_resolved = exclude.resolve() if exclude is not None else None
     labels: list[str] = []
     files_scanned = 0
     for path in sorted(images_dir.iterdir()):
         if not path.is_file():
             continue
         if _is_intermediate(path.name):
+            continue
+        if path.name in RESERVED_ARTIFACT_NAMES:
+            continue
+        if exclude_resolved is not None and path.resolve() == exclude_resolved:
             continue
         fmt = _format_for(path.suffix.lower())
         if fmt is None:
@@ -80,14 +95,17 @@ def collect_terms(images_dir: Path) -> tuple[list[str], int]:
     return sorted(set(labels)), files_scanned
 
 
-def count_terms(images_dir: Path) -> tuple[Counter[str], int]:
+def count_terms(images_dir: Path, exclude: Path | None = None) -> tuple[Counter[str], int]:
     """Scan images_dir for final-label sidecars and return (label_counts, files_scanned).
 
     The Counter maps each label to the number of sidecar files it appears in.
     A label is decoded at most once per file (sidecars do not repeat a label),
     so the count is effectively "how many images carry this label".
+
+    ``exclude`` names an output file to skip (e.g. the ``terms.txt`` being
+    (re)written) so a re-run never ingests its own previous output.
     """
-    labels, files_scanned = _scan_sidecars(images_dir)
+    labels, files_scanned = _scan_sidecars(images_dir, exclude=exclude)
     return Counter(labels), files_scanned
 
 

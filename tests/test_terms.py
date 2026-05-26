@@ -103,3 +103,47 @@ def test_cli_terms_missing_dir(tmp_path, capsys):
     rc = cli_main(["terms", "--images", str(tmp_path / "nope")])
     assert rc == 1
     assert "not a directory" in capsys.readouterr().err
+
+
+def test_count_terms_excludes_reserved_terms_txt(tmp_path):
+    _img(tmp_path, "a.jpg")
+    (tmp_path / "a.txt").write_text("outdoor, calm")
+    # A stale terms.txt must never be scanned as a label sidecar.
+    (tmp_path / "terms.txt").write_text("2 outdoor\n1 calm\n")
+    counts, n = count_terms(tmp_path)
+    assert counts == {"outdoor": 1, "calm": 1}
+    assert n == 1  # terms.txt not counted as a scanned sidecar
+
+
+def test_cli_terms_idempotent_on_rerun(tmp_path):
+    _img(tmp_path, "a.jpg")
+    _img(tmp_path, "b.jpg")
+    (tmp_path / "a.txt").write_text("outdoor, calm")
+    (tmp_path / "b.txt").write_text("outdoor")
+    cli_main(["terms", "--images", str(tmp_path)])
+    first = (tmp_path / "terms.txt").read_text()
+    cli_main(["terms", "--images", str(tmp_path)])
+    second = (tmp_path / "terms.txt").read_text()
+    assert first == second == "2 outdoor\n1 calm\n"
+
+
+def test_cli_terms_custom_output_inside_dir_excluded(tmp_path):
+    _img(tmp_path, "a.jpg")
+    (tmp_path / "a.txt").write_text("outdoor")
+    dest = tmp_path / "freq.txt"
+    cli_main(["terms", "--images", str(tmp_path), "--output", str(dest)])
+    first = dest.read_text()
+    # Re-run: the prior freq.txt lives in the scanned dir but must be excluded.
+    cli_main(["terms", "--images", str(tmp_path), "--output", str(dest)])
+    assert dest.read_text() == first == "1 outdoor\n"
+
+
+def test_collect_terms_ignores_stale_terms_txt(tmp_path):
+    # build's scanner shares the exclusion: a stale terms.txt is not a sidecar.
+    from labelman.build import collect_terms
+    _img(tmp_path, "a.jpg")
+    (tmp_path / "a.txt").write_text("outdoor")
+    (tmp_path / "terms.txt").write_text("5 outdoor\n")
+    terms, n = collect_terms(tmp_path)
+    assert terms == ["outdoor"]
+    assert n == 1

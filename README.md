@@ -141,7 +141,7 @@ Scan the final-label sidecars (`.txt`/`.mb`, excluding intermediate `.labels.*`/
 12 calm
 ```
 
-Output defaults to `terms.txt` in the images directory; use `--output` to write elsewhere.
+Output defaults to `terms.txt` in the images directory; use `--output` to write elsewhere. The output file is overwritten each run, and `terms.txt` (plus any `--output` file inside the scanned directory) is excluded from the scan, so re-running is idempotent.
 
 ### `labelman ui [--images DIR] [--host HOST] [--port PORT]`
 
