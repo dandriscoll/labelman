@@ -850,6 +850,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .grid-toolbar button, .grid-toolbar select { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; }
 .grid-toolbar button:hover { background: #1a5276; }
 .grid-toolbar button:disabled { opacity: 0.3; cursor: not-allowed; }
+.grid-toolbar button.active { background: #e94560; border-color: #e94560; }
+.magnifier-box { position: fixed; z-index: 2000; display: none; pointer-events: none; border: 2px solid #e94560; border-radius: 6px; background: #0f0f1e; box-shadow: 0 6px 24px rgba(0,0,0,0.6); }
+.magnifier-box img { display: block; max-width: 480px; max-height: 480px; border-radius: 4px; }
 .grid-toolbar .spacer { flex: 1; }
 .grid-toolbar .sel-info { font-size: 12px; color: #888; }
 .grid-container { flex: 1; overflow-y: auto; padding: 8px; display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--grid-size, 160px), 1fr)); gap: 6px; align-content: start; }
@@ -987,6 +990,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
           <button id="btn-grid-undo" disabled title="Undo selection (Ctrl+Z)">Undo</button>
           <button id="btn-grid-redo" disabled title="Redo selection (Ctrl+Y)">Redo</button>
           <button id="btn-grid-hide-labeled" title="Hide images that have .labels.txt">Hide labeled</button>
+          <button id="btn-grid-magnifier" title="Magnifier: hover a tile to preview it larger">Magnifier</button>
           <button id="btn-grid-refresh">Refresh</button>
           <button id="btn-edit-taxonomy" title="Edit labelman.yaml">Edit taxonomy</button>
           <select id="grid-per-page">
@@ -1042,6 +1046,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     </div>
   </div>
 </div>
+
+<div id="magnifier-box" class="magnifier-box"><img alt="" /></div>
 
 <div id="taxonomy-modal" class="tax-modal" style="display:none">
   <div class="tax-modal-box">
@@ -1268,6 +1274,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   // dblclick-to-list affordance only matters in grid view.
   function makeItemEl(img, i) {
     const el = document.createElement('div');
+    el.dataset.name = img.name;
     el.className = 'image-item' + (selectedSet.has(img.name) ? ' selected' : '') + (i === focusIdx ? ' focused' : '');
     el.innerHTML = `
       <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
@@ -1442,6 +1449,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     selUndoStack = [];
     selRedoStack = [];
     updateSelButtons();
+    hideMagnifier();  // the hover preview is grid-only
     if (viewMode === 'list') {
       $sidebar.style.display = '';
       $preview.style.display = '';
@@ -2219,6 +2227,51 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     $gridContainer.style.setProperty('--thumb-height', Math.round(sz * 0.75) + 'px');
     try { localStorage.setItem('labelman-grid-zoom', sz); } catch(e) {}
   });
+
+  // --- Magnifier mode (grid hover preview, #4) ---
+  let magnifierMode = false;
+  let magName = null;
+  const $magBox = document.getElementById('magnifier-box');
+  const $magImg = $magBox.querySelector('img');
+  const $btnMagnifier = document.getElementById('btn-grid-magnifier');
+
+  function hideMagnifier() { $magBox.style.display = 'none'; magName = null; }
+  function updateMagnifierBtn() {
+    $btnMagnifier.classList.toggle('active', magnifierMode);
+    if (!magnifierMode) hideMagnifier();
+  }
+  function positionMagnifier(clientX, clientY) {
+    const bw = $magBox.offsetWidth || 480, bh = $magBox.offsetHeight || 480;
+    let x = clientX + 24, y = clientY + 24;
+    if (x + bw > window.innerWidth) x = clientX - bw - 24;
+    if (y + bh > window.innerHeight) y = window.innerHeight - bh - 8;
+    if (x < 4) x = 4;
+    if (y < 4) y = 4;
+    $magBox.style.left = x + 'px';
+    $magBox.style.top = y + 'px';
+  }
+  $gridContainer.addEventListener('mousemove', (e) => {
+    if (!magnifierMode || viewMode !== 'grid') return;
+    const tile = e.target.closest('.image-item');
+    const name = tile ? tile.dataset.name : null;
+    if (!name) { hideMagnifier(); return; }
+    if (name !== magName) {
+      magName = name;
+      $magImg.src = `/api/images/${encodeURIComponent(name)}/thumb?size=512`;
+    }
+    $magBox.style.display = 'block';
+    positionMagnifier(e.clientX, e.clientY);
+  });
+  $gridContainer.addEventListener('mouseleave', hideMagnifier);
+  $btnMagnifier.addEventListener('click', () => {
+    magnifierMode = !magnifierMode;
+    updateMagnifierBtn();
+    try { localStorage.setItem('labelman-magnifier', magnifierMode ? '1' : '0'); } catch(e) {}
+  });
+  try {
+    magnifierMode = localStorage.getItem('labelman-magnifier') === '1';
+    updateMagnifierBtn();
+  } catch(e) {}
 
   // Auto-save raw text fields with debounce (single-select only)
   let rawManualTimer = null;
