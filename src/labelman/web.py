@@ -839,6 +839,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 .image-item:hover { background: #1a3a5c; }
 .image-item.focused { border-color: #e94560; background: #1a3a5c; }
 .image-item.selected { background: #2a1a3e; border-color: #9b59b6; }
+.image-item.selected.focused { border-color: #e94560; }
 .image-item .thumb { width: var(--list-thumb, 40px); height: var(--list-thumb, 40px); object-fit: cover; border-radius: 4px; background: #333; flex-shrink: 0; }
 .image-item .info { flex: 1; min-width: 0; }
 .image-item .name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1075,7 +1076,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   let currentLabels = [];
   let detectedLabels = [];
   let taxonomy = null;
-  let lastShiftIdx = -1;
+  let anchorIdx = -1;  // stable "current item" — one end of a shift-range (#2)
   let viewMode = 'list'; // 'list' or 'grid'
   let multiLabelData = {}; // {name: {manual: [], detected: []}}
   let hideLabeledMode = false;
@@ -1139,6 +1140,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     if (lastLoadedPage !== null && lastLoadedPage !== page) {
       selectedSet.clear();
       focusIdx = -1;
+      anchorIdx = -1;
     }
     lastLoadedPage = page;
     const data = await api(`/api/images?page=${page}&per_page=${perPage}${hideLabeledMode ? '&hide_labeled=1' : ''}`);
@@ -1170,7 +1172,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     images.forEach((img, i) => {
       const el = document.createElement('div');
       const isSel = selectedSet.has(img.name);
-      const isFocus = i === focusIdx && !isMultiSelect();
+      const isFocus = i === focusIdx;
       el.className = 'image-item' + (isFocus ? ' focused' : '') + (isSel ? ' selected' : '');
       el.innerHTML = `
         <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
@@ -1178,26 +1180,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
           <div class="name" title="${img.name}">${img.name}</div>
           <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
         </div>`;
-      el.addEventListener('click', (e) => {
-        if (e.shiftKey && lastShiftIdx >= 0) {
-          pushSelState();
-          const start = Math.min(lastShiftIdx, i);
-          const end = Math.max(lastShiftIdx, i);
-          for (let j = start; j <= end; j++) selectedSet.add(images[j].name);
-        } else if (e.ctrlKey || e.metaKey) {
-          pushSelState();
-          if (selectedSet.has(img.name)) selectedSet.delete(img.name);
-          else selectedSet.add(img.name);
-        } else {
-          selectedSet.clear();
-          selectedSet.add(img.name);
-          focusIdx = i;
-        }
-        lastShiftIdx = i;
-        focusIdx = i;
-        applyItemStates();
-        onSelectionChanged();
-      });
+      el.addEventListener('click', (e) => handleItemClick(i, e));
       $list.appendChild(el);
     });
   }
@@ -1208,14 +1191,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     selInfo.textContent = selectedSet.size > 0 ? `${selectedSet.size} selected` : `${total} images`;
     images.forEach((img, i) => {
       const el = document.createElement('div');
-      el.className = 'image-item' + (selectedSet.has(img.name) ? ' selected' : '');
+      el.className = 'image-item' + (selectedSet.has(img.name) ? ' selected' : '') + (i === focusIdx ? ' focused' : '');
       el.innerHTML = `
         <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
         <div class="info">
           <div class="name" title="${img.name}">${img.name}</div>
           <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
         </div>`;
-      el.addEventListener('click', (e) => handleGridClick(i, e));
+      el.addEventListener('click', (e) => handleItemClick(i, e));
       el.addEventListener('dblclick', (e) => {
         e.stopPropagation();
         focusIdx = i;
@@ -1231,13 +1214,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   // full renderList/renderGrid is reserved for when the image set changes.
   function applyItemStates() {
     const container = viewMode === 'grid' ? $gridContainer : $list;
-    const multi = isMultiSelect();
     const kids = container.children;
     for (let i = 0; i < kids.length; i++) {
       const img = images[i];
       if (!img) continue;
       const isSel = selectedSet.has(img.name);
-      const isFocus = viewMode === 'list' && i === focusIdx && !multi;
+      // Mark the current/anchor item in both views, even within a series, so the
+      // "one end of the series" is visible (#2).
+      const isFocus = i === focusIdx;
       kids[i].classList.toggle('selected', isSel);
       kids[i].classList.toggle('focused', isFocus);
     }
@@ -1261,24 +1245,40 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     cnt.classList.toggle('has-labels', c > 0);
   }
 
-  function handleGridClick(idx, e) {
-    pushSelState();
+  // Single selection state machine shared by list and grid (issue #2).
+  // anchorIdx is the stable "current item" — one end of a shift-range. It moves
+  // only on plain/ctrl click and single selection, never on shift-click, so a
+  // repeated shift-click resets the far end from the same anchor.
+  function handleItemClick(idx, e) {
     const name = images[idx].name;
-    if (e.shiftKey && lastShiftIdx >= 0) {
-      const start = Math.min(lastShiftIdx, idx);
-      const end = Math.max(lastShiftIdx, idx);
-      for (let i = start; i <= end; i++) {
-        selectedSet.add(images[i].name);
-      }
+    if (e.shiftKey) {
+      // Range from the anchor to here, replacing any prior range.
+      if (anchorIdx < 0 || anchorIdx >= images.length) anchorIdx = idx;
+      pushSelState();
+      selectedSet.clear();
+      const start = Math.min(anchorIdx, idx);
+      const end = Math.max(anchorIdx, idx);
+      for (let j = start; j <= end; j++) selectedSet.add(images[j].name);
+      focusIdx = idx;
+      // anchorIdx stays put.
     } else if (e.ctrlKey || e.metaKey) {
+      // Toggle this one; it becomes the anchor.
+      pushSelState();
       if (selectedSet.has(name)) selectedSet.delete(name);
       else selectedSet.add(name);
+      anchorIdx = idx;
+      focusIdx = idx;
+    } else if (selectedSet.has(name) && selectedSet.size > 1) {
+      // Click within an existing series: highlight only, keep the series.
+      focusIdx = idx;
     } else {
+      // Click outside the series (or single select): select just this one.
+      pushSelState();
       selectedSet.clear();
       selectedSet.add(name);
+      anchorIdx = idx;
+      focusIdx = idx;
     }
-    lastShiftIdx = idx;
-    focusIdx = idx;
     applyItemStates();
     onSelectionChanged();
   }
@@ -1316,6 +1316,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const img = images[idx];
     selectedSet.clear();
     selectedSet.add(img.name);
+    anchorIdx = idx;  // single selection becomes the shift anchor (#2)
     $currentName.textContent = img.name;
     $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(img.name)}/full" />`;
     $preview.appendChild($cropOverlay);
@@ -1334,6 +1335,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 
     viewMode = mode;
     selectedSet.clear();
+    anchorIdx = -1;
     selUndoStack = [];
     selRedoStack = [];
     updateSelButtons();
@@ -1984,6 +1986,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       pushSelState();
       selectedSet.clear();
       selectedSet.add(images[focusIdx].name);
+      anchorIdx = focusIdx;
       applyItemStates();
       onSelectionChanged();
       const el = $gridContainer.children[focusIdx];
@@ -2087,8 +2090,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   document.getElementById('btn-grid-redo').addEventListener('click', selRedo);
 
   // Event listeners - sidebar (list mode)
-  document.getElementById('btn-prev').addEventListener('click', () => { if (page > 1) { page--; selectedSet.clear(); focusIdx = -1; loadImages(); } });
-  document.getElementById('btn-next').addEventListener('click', () => { if (page < pages) { page++; selectedSet.clear(); focusIdx = -1; loadImages(); } });
+  document.getElementById('btn-prev').addEventListener('click', () => { if (page > 1) { page--; selectedSet.clear(); focusIdx = -1; anchorIdx = -1; loadImages(); } });
+  document.getElementById('btn-next').addEventListener('click', () => { if (page < pages) { page++; selectedSet.clear(); focusIdx = -1; anchorIdx = -1; loadImages(); } });
   document.getElementById('btn-refresh').addEventListener('click', async () => {
     await api('/api/refresh', {method: 'POST'});
     await loadImages();
@@ -2107,8 +2110,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   });
 
   // Event listeners - grid toolbar
-  document.getElementById('btn-grid-prev').addEventListener('click', () => { if (page > 1) { page--; selectedSet.clear(); loadImages(); onSelectionChanged(); } });
-  document.getElementById('btn-grid-next').addEventListener('click', () => { if (page < pages) { page++; selectedSet.clear(); loadImages(); onSelectionChanged(); } });
+  document.getElementById('btn-grid-prev').addEventListener('click', () => { if (page > 1) { page--; selectedSet.clear(); anchorIdx = -1; loadImages(); onSelectionChanged(); } });
+  document.getElementById('btn-grid-next').addEventListener('click', () => { if (page < pages) { page++; selectedSet.clear(); anchorIdx = -1; loadImages(); onSelectionChanged(); } });
   document.getElementById('btn-grid-refresh').addEventListener('click', async () => {
     await api('/api/refresh', {method: 'POST'});
     await loadImages();
@@ -2233,6 +2236,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     hideLabeledMode = !hideLabeledMode;
     updateHideLabeledBtn();
     selectedSet.clear();
+    anchorIdx = -1;
 
     if (focusedName && !hideLabeledMode) {
       // Untoggling: find the focused image in the full unfiltered list
