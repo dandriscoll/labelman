@@ -1150,6 +1150,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     images = [];
     loadedPages = 0;
     loading = false;
+    preloadReset();
     await loadMore();
     if (viewMode === 'list' && images.length > 0) focusByIndex(0);
     else onSelectionChanged();
@@ -1196,8 +1197,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       if (!ok) break;
     }
     updateLoadProgress();
-    $saveStatus.textContent = `Loaded all ${total}`;
-    setTimeout(() => { $saveStatus.textContent = ''; }, 2000);
+    // Warm all full images into memory; the preload progress takes over the
+    // status line from here (so no "Loaded all" clearing timeout).
+    startPreloadAll();
   }
 
   // Scroll handler: when near the bottom of the active view, load the next batch.
@@ -1233,6 +1235,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     images = [];
     loadedPages = 0;
     loading = false;
+    preloadReset();
     await loadMore();
     if (name) {
       const idx = await ensureLoadedName(name);
@@ -1249,6 +1252,69 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     document.getElementById('grid-page-info').textContent = total ? `${loaded} / ${total}` : '';
     document.getElementById('btn-load-all').disabled = done;
     document.getElementById('grid-load-all').disabled = done;
+  }
+
+  // --- Preload-all (#3 follow-up) ---
+  // After "Load all", warm every full-resolution image into browser memory so
+  // navigation is instant. The fetch order is dynamic: pumpPreload() always
+  // starts at the current focus and walks forward (wrapping), recomputed each
+  // time a slot frees, so selecting a new image re-prioritizes the queue from
+  // that point forward. Image refs are retained in `preloads` to keep the bytes
+  // resident; a small concurrency cap avoids saturating the connection.
+  let preloadOn = false;
+  const preloads = new Map();      // name -> Image (held to keep bytes in memory)
+  let preloadInFlight = 0;
+  const PRELOAD_CONCURRENCY = 3;
+
+  function preloadReset() {
+    preloadOn = false;
+    preloads.clear();
+    preloadInFlight = 0;
+  }
+
+  function startPreloadAll() {
+    preloadOn = true;
+    pumpPreload();
+  }
+
+  function pumpPreload() {
+    if (!preloadOn) return;
+    const n = images.length;
+    if (n === 0) return;
+    const start = focusIdx >= 0 ? focusIdx : 0;
+    for (let k = 0; k < n && preloadInFlight < PRELOAD_CONCURRENCY; k++) {
+      const img = images[(start + k) % n];
+      if (img && !preloads.has(img.name)) preloadOne(img.name);
+    }
+    updatePreloadProgress();
+  }
+
+  function preloadOne(name) {
+    const im = new Image();
+    preloads.set(name, im);   // mark started immediately so we never double-fetch
+    preloadInFlight++;
+    const done = () => {
+      preloadInFlight--;
+      updatePreloadProgress();
+      pumpPreload();          // re-evaluate priority for the freed slot
+    };
+    im.onload = done;
+    im.onerror = done;
+    im.src = `/api/images/${encodeURIComponent(name)}/full`;
+  }
+
+  function updatePreloadProgress() {
+    if (!preloadOn) return;
+    const n = images.length;
+    const done = preloads.size - preloadInFlight;   // started minus still-loading
+    if (done >= n) {
+      $saveStatus.textContent = `Preloaded ${n}`;
+      setTimeout(() => {
+        if ($saveStatus.textContent === `Preloaded ${n}`) $saveStatus.textContent = '';
+      }, 2000);
+    } else {
+      $saveStatus.textContent = `Preloading ${done} / ${n}`;
+    }
   }
 
   // Unified focus setter: select the image at absolute index `idx` and reveal it.
@@ -1416,11 +1482,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       loadLabels(names[0]);
     } else {
       $currentName.textContent = `${names.length} images selected`;
+      // Even within a multi-selection, the main viewer follows the focused item,
+      // so clicking an image inside the series previews it (the label panel still
+      // shows the multi-edit form for the whole selection).
+      if (viewMode === 'list' && focusIdx >= 0 && images[focusIdx]) {
+        $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(images[focusIdx].name)}/full" />`;
+        $preview.appendChild($cropOverlay);
+        resetZoom();
+      }
       $addSection.style.display = 'block';
       $rawSection.style.display = 'none';
       document.getElementById('delete-section').style.display = 'none';
       loadMultiLabels(names);
     }
+    pumpPreload();  // focus may have moved — re-prioritize the preload queue (#3)
   }
 
   function selectImage(idx) {
@@ -2627,6 +2702,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     resetZoom();
     clearCrop();
     origSelectImage(idx);
+    pumpPreload();  // list-mode focus moved — re-prioritize the preload queue (#3)
   };
 
   // Crop keyboard shortcuts — handled in the main keydown handler below
