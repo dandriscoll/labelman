@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import errno
+import io
 import json
 import math
 import shutil
 import threading
+from collections import OrderedDict
 from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -39,6 +41,58 @@ MIME_TYPES = {
 
 DEFAULT_PER_PAGE = 50
 MAX_REQUEST_BODY = 1_048_576  # 1 MB
+
+# Thumbnail generation: the list/grid views request downscaled thumbnails so the
+# browser does not have to download and decode full-resolution originals (the
+# dominant cause of UI hangs on large datasets). Thumbnails are cached in memory
+# keyed by (path, mtime, size). The preview pane uses the separate /full endpoint
+# to keep full resolution for zoom and crop.
+DEFAULT_THUMB_SIZE = 400
+MIN_THUMB_SIZE = 64
+MAX_THUMB_SIZE = 1024
+_THUMB_CACHE_MAX = 256
+_thumb_cache: "OrderedDict[tuple, bytes]" = OrderedDict()
+_thumb_lock = threading.Lock()
+
+
+def make_thumbnail(path: Path, size: int) -> bytes | None:
+    """Return JPEG bytes of a thumbnail of `path` no larger than size x size.
+
+    Cached in memory keyed by (path, mtime, size). Returns None if the file is
+    not a decodable image (the caller falls back to serving the original bytes).
+    """
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    key = (str(path), mtime, size)
+    with _thumb_lock:
+        hit = _thumb_cache.get(key)
+        if hit is not None:
+            _thumb_cache.move_to_end(key)
+            return hit
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            img.thumbnail((size, size))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=82)
+            data = buf.getvalue()
+    except Exception:
+        # Not an image, truncated, or unsupported — caller serves original bytes.
+        return None
+    with _thumb_lock:
+        _thumb_cache[key] = data
+        _thumb_cache.move_to_end(key)
+        while len(_thumb_cache) > _THUMB_CACHE_MAX:
+            _thumb_cache.popitem(last=False)
+    return data
 
 
 class ImageIndex:
@@ -272,7 +326,10 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             self._send_json({"name": name})
         elif path.startswith("/api/images/") and path.endswith("/thumb"):
             name = unquote(path[len("/api/images/"):-len("/thumb")])
-            self._handle_get_thumb(name)
+            self._handle_get_thumb(name, qs)
+        elif path.startswith("/api/images/") and path.endswith("/full"):
+            name = unquote(path[len("/api/images/"):-len("/full")])
+            self._handle_get_full(name)
         elif path.startswith("/api/images/") and path.endswith("/labels"):
             name = unquote(path[len("/api/images/"):-len("/labels")])
             self._handle_get_labels(name)
@@ -360,7 +417,35 @@ class LabelmanHandler(BaseHTTPRequestHandler):
             "pages": pages,
         })
 
-    def _handle_get_thumb(self, name: str) -> None:
+    def _handle_get_thumb(self, name: str, qs: dict | None = None) -> None:
+        path = self.index.resolve_image(name)
+        if path is None:
+            self._send_error(404, "Image not found")
+            return
+        size = DEFAULT_THUMB_SIZE
+        if qs:
+            try:
+                size = int(qs.get("size", [str(DEFAULT_THUMB_SIZE)])[0])
+            except (ValueError, TypeError):
+                size = DEFAULT_THUMB_SIZE
+        size = max(MIN_THUMB_SIZE, min(MAX_THUMB_SIZE, size))
+        thumb = make_thumbnail(path, size)
+        if thumb is not None:
+            mime = "image/jpeg"
+            data = thumb
+        else:
+            # Not decodable as an image — serve the original bytes verbatim.
+            mime = MIME_TYPES.get(path.suffix.lower(), "application/octet-stream")
+            data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_get_full(self, name: str) -> None:
+        """Serve the original, full-resolution image bytes (preview/zoom/crop)."""
         path = self.index.resolve_image(name)
         if path is None:
             self._send_error(404, "Image not found")
@@ -1009,7 +1094,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     selRedoStack.push(new Set(selectedSet));
     selectedSet = selUndoStack.pop();
     updateSelButtons();
-    renderGrid();
+    applyItemStates();
     onSelectionChanged();
   }
   function selRedo() {
@@ -1017,7 +1102,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     selUndoStack.push(new Set(selectedSet));
     selectedSet = selRedoStack.pop();
     updateSelButtons();
-    renderGrid();
+    applyItemStates();
     onSelectionChanged();
   }
   function updateSelButtons() {
@@ -1110,7 +1195,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         }
         lastShiftIdx = i;
         focusIdx = i;
-        renderList();
+        applyItemStates();
         onSelectionChanged();
       });
       $list.appendChild(el);
@@ -1140,6 +1225,42 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     });
   }
 
+  // Incremental selection repaint: update only the selected/focused classes on
+  // existing elements instead of rebuilding the whole list/grid (which would
+  // recreate every <img> and force re-decode). Used for selection/nav changes;
+  // full renderList/renderGrid is reserved for when the image set changes.
+  function applyItemStates() {
+    const container = viewMode === 'grid' ? $gridContainer : $list;
+    const multi = isMultiSelect();
+    const kids = container.children;
+    for (let i = 0; i < kids.length; i++) {
+      const img = images[i];
+      if (!img) continue;
+      const isSel = selectedSet.has(img.name);
+      const isFocus = viewMode === 'list' && i === focusIdx && !multi;
+      kids[i].classList.toggle('selected', isSel);
+      kids[i].classList.toggle('focused', isFocus);
+    }
+    if (viewMode === 'grid') {
+      const selInfo = document.getElementById('grid-sel-info');
+      if (selInfo) selInfo.textContent = selectedSet.size > 0 ? `${selectedSet.size} selected` : `${total} images`;
+    }
+  }
+
+  // Update only one item's label-count text after a save, no full re-render.
+  function updateItemCount(name) {
+    const i = images.findIndex(im => im.name === name);
+    if (i < 0) return;
+    const container = viewMode === 'grid' ? $gridContainer : $list;
+    const el = container.children[i];
+    if (!el) return;
+    const cnt = el.querySelector('.label-count');
+    if (!cnt) return;
+    const c = images[i].label_count;
+    cnt.textContent = `${c} label${c !== 1 ? 's' : ''}`;
+    cnt.classList.toggle('has-labels', c > 0);
+  }
+
   function handleGridClick(idx, e) {
     pushSelState();
     const name = images[idx].name;
@@ -1158,7 +1279,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     }
     lastShiftIdx = idx;
     focusIdx = idx;
-    renderGrid();
+    applyItemStates();
     onSelectionChanged();
   }
 
@@ -1173,7 +1294,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     } else if (names.length === 1) {
       $currentName.textContent = names[0];
       if (viewMode === 'list') {
-        $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(names[0])}/thumb" />`;
+        $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(names[0])}/full" />`;
         $preview.appendChild($cropOverlay);
         resetZoom();
       }
@@ -1196,7 +1317,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     selectedSet.clear();
     selectedSet.add(img.name);
     $currentName.textContent = img.name;
-    $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(img.name)}/thumb" />`;
+    $preview.innerHTML = `<img src="/api/images/${encodeURIComponent(img.name)}/full" />`;
     $preview.appendChild($cropOverlay);
     $addSection.style.display = 'block';
     $rawSection.style.display = 'block';
@@ -1764,7 +1885,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       const totalCount = currentLabels.length + detectedLabels.length;
       img.label_count = totalCount;
       img.has_labels = totalCount > 0;
-      if (viewMode === 'grid') renderGrid(); else renderList();
+      updateItemCount(name);
     }
   }
 
@@ -1857,13 +1978,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   function navApply() {
     if (viewMode === 'list') {
       selectImage(focusIdx);
-      renderList();
+      applyItemStates();
       scrollToFocused();
     } else {
       pushSelState();
       selectedSet.clear();
       selectedSet.add(images[focusIdx].name);
-      renderGrid();
+      applyItemStates();
       onSelectionChanged();
       const el = $gridContainer.children[focusIdx];
       if (el) el.scrollIntoView({block: 'nearest'});
@@ -1930,7 +2051,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       if (viewMode === 'grid') {
         pushSelState();
         selectedSet.clear();
-        renderGrid();
+        applyItemStates();
         onSelectionChanged();
       }
     }
@@ -1939,7 +2060,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       if (viewMode === 'grid') {
         pushSelState();
         images.forEach(img => selectedSet.add(img.name));
-        renderGrid();
+        applyItemStates();
         onSelectionChanged();
       }
     }
