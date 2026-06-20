@@ -71,6 +71,33 @@ def test_index_pagination_last_page(index):
     assert total == 5
 
 
+def test_pagination_contract_covers_all_exactly_once(server):
+    """Infinite scroll / Load all iterate page=1..pages and concatenate.
+
+    The contract that must hold for that to be correct: walking every page at a
+    given per_page yields each image exactly once, with no gaps or overlaps, and
+    `pages` is consistent with `total`.
+    """
+    conn, _ = server
+    per_page = 2
+    status, first = _get_json(conn, f"/api/images?page=1&per_page={per_page}")
+    assert status == 200
+    total = first["total"]
+    pages = first["pages"]
+    assert pages == -(-total // per_page)  # ceil
+
+    seen = []
+    for p in range(1, pages + 1):
+        _, data = _get_json(conn, f"/api/images?page={p}&per_page={per_page}")
+        assert data["total"] == total
+        seen.extend(img["name"] for img in data["images"])
+
+    # Every image once, in order, no duplicates.
+    assert len(seen) == total
+    assert len(set(seen)) == total
+    assert seen == sorted(seen)
+
+
 def test_index_has_labels(index):
     items, _ = index.list_images()
     labeled = [i for i in items if i["has_labels"]]

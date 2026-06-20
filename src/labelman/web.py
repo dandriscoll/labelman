@@ -958,9 +958,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     </div>
     <div class="image-list" id="image-list"></div>
     <div class="pagination">
-      <button id="btn-prev" disabled>&larr; Prev</button>
+      <button id="btn-load-all" title="Load all images and thumbnails">Load all</button>
       <span id="page-info">-</span>
-      <button id="btn-next" disabled>Next &rarr;</button>
     </div>
   </div>
   <div class="main">
@@ -1001,8 +1000,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
           <span class="spacer"></span>
           <span class="sel-info" id="grid-sel-info"></span>
           <span id="grid-page-info" style="font-size:12px;color:#888"></span>
-          <button id="btn-grid-prev" disabled>&larr;</button>
-          <button id="btn-grid-next" disabled>&rarr;</button>
+          <button id="grid-load-all" title="Load all images and thumbnails">Load all</button>
         </div>
         <div class="grid-container" id="grid-container"></div>
       </div>
@@ -1066,11 +1064,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 
 <script>
 (function() {
-  let images = [];
+  let images = [];          // accumulated across pages; indices are absolute (#3)
   let total = 0;
-  let page = 1;
-  let perPage = 50;
-  let pages = 1;
+  let perPage = 50;         // batch size for infinite scroll
+  let totalPages = 1;
+  let loadedPages = 0;      // contiguous pages loaded so far
+  let loading = false;      // guard against overlapping fetches
   let focusIdx = -1;
   let selectedSet = new Set();
   let currentLabels = [];
@@ -1135,77 +1134,183 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 
   function isMultiSelect() { return selectedSet.size > 1; }
 
-  let lastLoadedPage = null;
+  // --- Loading: infinite scroll with accumulation (#3) ---
+  // `images` accumulates contiguous pages; indices are absolute. loadImages does
+  // a full reset + first batch; loadMore appends the next batch (scroll / button).
   async function loadImages() {
-    if (lastLoadedPage !== null && lastLoadedPage !== page) {
-      selectedSet.clear();
-      focusIdx = -1;
-      anchorIdx = -1;
+    selectedSet.clear();
+    focusIdx = -1;
+    anchorIdx = -1;
+    images = [];
+    loadedPages = 0;
+    loading = false;
+    await loadMore();
+    if (viewMode === 'list' && images.length > 0) focusByIndex(0);
+    else onSelectionChanged();
+  }
+
+  async function loadMore() {
+    if (loading) return false;
+    if (loadedPages > 0 && loadedPages >= totalPages) return false;
+    loading = true;
+    const nextPage = loadedPages + 1;
+    const startIdx = images.length;
+    let data;
+    try {
+      data = await api(`/api/images?page=${nextPage}&per_page=${perPage}${hideLabeledMode ? '&hide_labeled=1' : ''}`);
+    } catch (e) {
+      loading = false;
+      return false;
     }
-    lastLoadedPage = page;
-    const data = await api(`/api/images?page=${page}&per_page=${perPage}${hideLabeledMode ? '&hide_labeled=1' : ''}`);
-    images = data.images;
     total = data.total;
-    pages = data.pages;
+    totalPages = data.pages;
+    images = nextPage === 1 ? data.images : images.concat(data.images);
+    loadedPages = nextPage;
     $stats.textContent = `${total} images`;
-    if (viewMode === 'list') {
-      $pageInfo.textContent = `${page} / ${pages}`;
-      document.getElementById('btn-prev').disabled = page <= 1;
-      document.getElementById('btn-next').disabled = page >= pages;
-      renderList();
-      if (images.length > 0 && focusIdx < 0) {
-        focusIdx = 0;
-        selectImage(0);
-      } else if (focusIdx >= images.length) {
-        focusIdx = Math.max(0, images.length - 1);
-      }
+    if (nextPage === 1) {
+      if (viewMode === 'list') renderList(); else renderGrid();
     } else {
-      document.getElementById('grid-page-info').textContent = `${page} / ${pages}`;
-      document.getElementById('btn-grid-prev').disabled = page <= 1;
-      document.getElementById('btn-grid-next').disabled = page >= pages;
-      renderGrid();
+      appendToView(startIdx);
     }
+    updateLoadProgress();
+    loading = false;
+    // Auto-fill: if the view isn't scrollable yet and more remain, keep loading
+    // so infinite scroll can engage on tall viewports.
+    const container = viewMode === 'grid' ? $gridContainer : $list;
+    if (loadedPages < totalPages && container.scrollHeight <= container.clientHeight + 4) {
+      loadMore();
+    }
+    return true;
+  }
+
+  async function loadAll() {
+    $saveStatus.textContent = 'Loading all...';
+    while (loadedPages < totalPages) {
+      const ok = await loadMore();
+      if (!ok) break;
+    }
+    updateLoadProgress();
+    $saveStatus.textContent = `Loaded all ${total}`;
+    setTimeout(() => { $saveStatus.textContent = ''; }, 2000);
+  }
+
+  // Scroll handler: when near the bottom of the active view, load the next batch.
+  function maybeScrollLoad(container) {
+    if (loading || loadedPages >= totalPages) return;
+    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 300) {
+      loadMore();
+    }
+  }
+
+  // Load successive batches until absolute index `idx` is present (or all loaded).
+  async function ensureLoadedIdx(idx) {
+    while (images.length <= idx && loadedPages < totalPages) {
+      if (!await loadMore()) break;
+    }
+  }
+  // Load successive batches until an image named `name` is present; returns index.
+  async function ensureLoadedName(name) {
+    let idx = images.findIndex(im => im.name === name);
+    while (idx < 0 && loadedPages < totalPages) {
+      if (!await loadMore()) break;
+      idx = images.findIndex(im => im.name === name);
+    }
+    return idx;
+  }
+
+  // Reset + first batch, then restore focus to `name` if it still exists, else
+  // auto-select the first image in list view.
+  async function reloadPreservingFocus(name) {
+    selectedSet.clear();
+    focusIdx = -1;
+    anchorIdx = -1;
+    images = [];
+    loadedPages = 0;
+    loading = false;
+    await loadMore();
+    if (name) {
+      const idx = await ensureLoadedName(name);
+      if (idx >= 0) { focusByIndex(idx); return; }
+    }
+    if (viewMode === 'list' && images.length > 0) focusByIndex(0);
+    else onSelectionChanged();
+  }
+
+  function updateLoadProgress() {
+    const loaded = images.length;
+    const done = loadedPages >= totalPages;
+    $pageInfo.textContent = total ? `${loaded} / ${total}` : '-';
+    document.getElementById('grid-page-info').textContent = total ? `${loaded} / ${total}` : '';
+    document.getElementById('btn-load-all').disabled = done;
+    document.getElementById('grid-load-all').disabled = done;
+  }
+
+  // Unified focus setter: select the image at absolute index `idx` and reveal it.
+  function focusByIndex(idx) {
+    if (idx < 0 || idx >= images.length) return;
+    focusIdx = idx;
+    if (viewMode === 'list') {
+      selectImage(idx);   // sets selectedSet, anchorIdx, preview, labels
+      applyItemStates();
+      scrollToFocused();
+    } else {
+      selectedSet.clear();
+      selectedSet.add(images[idx].name);
+      anchorIdx = idx;
+      applyItemStates();
+      onSelectionChanged();
+      const el = $gridContainer.children[idx];
+      if (el) el.scrollIntoView({block: 'nearest'});
+    }
+  }
+
+  // One element builder for both list and grid (#3): markup is identical, and the
+  // dblclick-to-list affordance only matters in grid view.
+  function makeItemEl(img, i) {
+    const el = document.createElement('div');
+    el.className = 'image-item' + (selectedSet.has(img.name) ? ' selected' : '') + (i === focusIdx ? ' focused' : '');
+    el.innerHTML = `
+      <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
+      <div class="info">
+        <div class="name" title="${img.name}">${img.name}</div>
+        <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
+      </div>`;
+    el.addEventListener('click', (e) => handleItemClick(i, e));
+    el.addEventListener('dblclick', (e) => {
+      if (viewMode !== 'grid') return;
+      e.stopPropagation();
+      focusIdx = i;
+      setViewMode('list');
+    });
+    return el;
   }
 
   function renderList() {
     $list.innerHTML = '';
-    images.forEach((img, i) => {
-      const el = document.createElement('div');
-      const isSel = selectedSet.has(img.name);
-      const isFocus = i === focusIdx;
-      el.className = 'image-item' + (isFocus ? ' focused' : '') + (isSel ? ' selected' : '');
-      el.innerHTML = `
-        <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
-        <div class="info">
-          <div class="name" title="${img.name}">${img.name}</div>
-          <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
-        </div>`;
-      el.addEventListener('click', (e) => handleItemClick(i, e));
-      $list.appendChild(el);
-    });
+    const frag = document.createDocumentFragment();
+    images.forEach((img, i) => frag.appendChild(makeItemEl(img, i)));
+    $list.appendChild(frag);
   }
 
   function renderGrid() {
     $gridContainer.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    images.forEach((img, i) => frag.appendChild(makeItemEl(img, i)));
+    $gridContainer.appendChild(frag);
     const selInfo = document.getElementById('grid-sel-info');
     selInfo.textContent = selectedSet.size > 0 ? `${selectedSet.size} selected` : `${total} images`;
-    images.forEach((img, i) => {
-      const el = document.createElement('div');
-      el.className = 'image-item' + (selectedSet.has(img.name) ? ' selected' : '') + (i === focusIdx ? ' focused' : '');
-      el.innerHTML = `
-        <img class="thumb" src="/api/images/${encodeURIComponent(img.name)}/thumb" loading="lazy" />
-        <div class="info">
-          <div class="name" title="${img.name}">${img.name}</div>
-          <div class="label-count ${img.label_count > 0 ? 'has-labels' : ''}">${img.label_count} label${img.label_count !== 1 ? 's' : ''}</div>
-        </div>`;
-      el.addEventListener('click', (e) => handleItemClick(i, e));
-      el.addEventListener('dblclick', (e) => {
-        e.stopPropagation();
-        focusIdx = i;
-        setViewMode('list');
-      });
-      $gridContainer.appendChild(el);
-    });
+  }
+
+  // Append only the new items [startIdx..] to the active container (scroll/more).
+  function appendToView(startIdx) {
+    const container = viewMode === 'grid' ? $gridContainer : $list;
+    const frag = document.createDocumentFragment();
+    for (let i = startIdx; i < images.length; i++) frag.appendChild(makeItemEl(images[i], i));
+    container.appendChild(frag);
+    if (viewMode === 'grid') {
+      const selInfo = document.getElementById('grid-sel-info');
+      selInfo.textContent = selectedSet.size > 0 ? `${selectedSet.size} selected` : `${total} images`;
+    }
   }
 
   // Incremental selection repaint: update only the selected/focused classes on
@@ -1327,11 +1432,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   }
 
   function setViewMode(mode) {
-    // Remember current focused image name before switching
+    // Remember the focused image so it can be re-revealed in the new view. The
+    // accumulated images are kept — switching views re-renders, never refetches.
     const focusedName = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
-    // Compute absolute index of focused image across all pages
-    const oldPerPage = perPage;
-    const absIdx = focusedName ? (page - 1) * oldPerPage + focusIdx : 0;
 
     viewMode = mode;
     selectedSet.clear();
@@ -1350,25 +1453,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       $gridArea.style.display = '';
       document.getElementById('btn-view-toggle').textContent = 'Grid';
     }
-    // Keep perPage stable across view switches for consistent paging
 
-    // Compute page that contains the focused image under the new perPage
-    page = Math.floor(absIdx / perPage) + 1;
-    focusIdx = absIdx % perPage;
-    lastLoadedPage = page; // prevent loadImages from clearing focus
-
-    loadImages().then(() => {
-      if (viewMode === 'list') {
-        if (focusIdx >= 0 && focusIdx < images.length) {
-          selectImage(focusIdx);
-          renderList();
-          scrollToFocused();
-        }
-      } else {
-        if (focusedName) selectedSet.add(focusedName);
-        onSelectionChanged();
-      }
-    });
+    // Render the accumulation into the now-active view and restore focus.
+    if (viewMode === 'list') renderList(); else renderGrid();
+    updateLoadProgress();
+    const idx = focusedName ? images.findIndex(im => im.name === focusedName) : -1;
+    if (idx >= 0) focusByIndex(idx);
+    else if (viewMode === 'list' && images.length > 0) focusByIndex(0);
+    else onSelectionChanged();
+    // The new view may be taller than the old one — fill if not yet scrollable.
+    const container = viewMode === 'grid' ? $gridContainer : $list;
+    if (loadedPages < totalPages && container.scrollHeight <= container.clientHeight + 4) loadMore();
   }
 
   async function loadLabels(name) {
@@ -1952,14 +2047,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   }
 
   // Keyboard navigation (list mode only)
-  function navNext() {
+  async function navNext() {
     if (focusIdx < images.length - 1) {
       focusIdx++;
-    } else if (page < pages) {
-      page++;
-      focusIdx = 0;
-      loadImages().then(() => navApply());
-      return;
+    } else if (loadedPages < totalPages) {
+      // At the end of the loaded set — pull the next batch then advance.
+      await loadMore();
+      if (focusIdx < images.length - 1) focusIdx++;
+      else return;
     } else {
       return;
     }
@@ -1968,10 +2063,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   function navPrev() {
     if (focusIdx > 0) {
       focusIdx--;
-    } else if (page > 1) {
-      page--;
-      loadImages().then(() => { focusIdx = images.length - 1; navApply(); });
-      return;
     } else {
       return;
     }
@@ -2090,16 +2181,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   document.getElementById('btn-grid-redo').addEventListener('click', selRedo);
 
   // Event listeners - sidebar (list mode)
-  document.getElementById('btn-prev').addEventListener('click', () => { if (page > 1) { page--; selectedSet.clear(); focusIdx = -1; anchorIdx = -1; loadImages(); } });
-  document.getElementById('btn-next').addEventListener('click', () => { if (page < pages) { page++; selectedSet.clear(); focusIdx = -1; anchorIdx = -1; loadImages(); } });
+  document.getElementById('btn-load-all').addEventListener('click', loadAll);
+  $list.addEventListener('scroll', () => { if (viewMode === 'list') maybeScrollLoad($list); });
   document.getElementById('btn-refresh').addEventListener('click', async () => {
+    const fn = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
     await api('/api/refresh', {method: 'POST'});
-    await loadImages();
+    await reloadPreservingFocus(fn);
   });
   document.getElementById('per-page').addEventListener('change', (e) => {
     perPage = parseInt(e.target.value);
     document.getElementById('grid-per-page').value = e.target.value;
-    page = 1;
     loadImages();
   });
   document.getElementById('btn-add').addEventListener('click', addLabel);
@@ -2110,16 +2201,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   });
 
   // Event listeners - grid toolbar
-  document.getElementById('btn-grid-prev').addEventListener('click', () => { if (page > 1) { page--; selectedSet.clear(); anchorIdx = -1; loadImages(); onSelectionChanged(); } });
-  document.getElementById('btn-grid-next').addEventListener('click', () => { if (page < pages) { page++; selectedSet.clear(); anchorIdx = -1; loadImages(); onSelectionChanged(); } });
+  document.getElementById('grid-load-all').addEventListener('click', loadAll);
+  $gridContainer.addEventListener('scroll', () => { if (viewMode === 'grid') maybeScrollLoad($gridContainer); });
   document.getElementById('btn-grid-refresh').addEventListener('click', async () => {
+    const fn = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
     await api('/api/refresh', {method: 'POST'});
-    await loadImages();
+    await reloadPreservingFocus(fn);
   });
   document.getElementById('grid-per-page').addEventListener('change', (e) => {
     perPage = parseInt(e.target.value);
     document.getElementById('per-page').value = e.target.value;
-    page = 1;
     loadImages();
   });
   document.getElementById('grid-zoom').addEventListener('input', (e) => {
@@ -2163,13 +2254,22 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
   // Delete image
   async function deleteCurrentImage() {
     if (focusIdx < 0) return;
+    const targetIdx = focusIdx;  // the next image slides into this absolute index
     const name = images[focusIdx].name;
     await fetch(`/api/images/${encodeURIComponent(name)}`, {method: 'DELETE'});
     selectedSet.delete(name);
-    await loadImages();
-    if (focusIdx >= images.length) focusIdx = Math.max(0, images.length - 1);
-    if (images.length > 0) {
-      if (viewMode === 'list') { selectImage(focusIdx); renderList(); }
+    // Reload from scratch (the server index changed) and focus the image that
+    // now occupies the deleted slot, loading enough batches to reach it.
+    images = [];
+    loadedPages = 0;
+    loading = false;
+    focusIdx = -1;
+    anchorIdx = -1;
+    await loadMore();
+    if (total > 0) {
+      const idx = Math.min(targetIdx, total - 1);
+      await ensureLoadedIdx(idx);
+      focusByIndex(Math.min(idx, images.length - 1));
     } else {
       $currentName.textContent = 'No image selected';
       $preview.innerHTML = '<span class="empty">No images remaining</span>';
@@ -2178,6 +2278,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
       $addSection.style.display = 'none';
       $rawSection.style.display = 'none';
       document.getElementById('delete-section').style.display = 'none';
+      updateLoadProgress();
     }
   }
   document.getElementById('btn-delete').addEventListener('click', deleteCurrentImage);
@@ -2210,18 +2311,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const after = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
     const data = await api(`/api/next-unlabeled${after ? '?after=' + encodeURIComponent(after) : ''}`);
     if (!data.name) { $saveStatus.textContent = 'All images labeled'; setTimeout(() => { $saveStatus.textContent = ''; }, 2000); return; }
-    // Find page and index for this image
-    // Refresh to find the image in the full list
-    const allData = await api(`/api/images?page=1&per_page=${total || 9999}`);
-    const idx = allData.images.findIndex(i => i.name === data.name);
+    // Load successive batches until the target image is in the accumulated list.
+    const idx = await ensureLoadedName(data.name);
     if (idx < 0) return;
-    const targetPage = Math.floor(idx / perPage) + 1;
-    if (targetPage !== page) { page = targetPage; await loadImages(); }
-    const localIdx = idx % perPage;
-    focusIdx = localIdx;
-    selectImage(focusIdx);
-    renderList();
-    scrollToFocused();
+    focusByIndex(idx);
   });
 
   // Hide labeled toggle
@@ -2235,32 +2328,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const focusedName = focusIdx >= 0 && images[focusIdx] ? images[focusIdx].name : null;
     hideLabeledMode = !hideLabeledMode;
     updateHideLabeledBtn();
-    selectedSet.clear();
-    anchorIdx = -1;
-
-    if (focusedName && !hideLabeledMode) {
-      // Untoggling: find the focused image in the full unfiltered list
-      const allData = await api(`/api/images?page=1&per_page=${total || 9999}`);
-      const absIdx = allData.images.findIndex(i => i.name === focusedName);
-      if (absIdx >= 0) {
-        page = Math.floor(absIdx / perPage) + 1;
-        focusIdx = absIdx % perPage;
-      } else {
-        page = 1;
-        focusIdx = 0;
-      }
-    } else {
-      page = 1;
-      focusIdx = -1;
-    }
-
-    await loadImages();
-    if (viewMode === 'list' && focusIdx >= 0 && focusIdx < images.length) {
-      selectImage(focusIdx);
-      renderList();
-      scrollToFocused();
-    }
-    if (viewMode === 'grid') onSelectionChanged();
+    // Turning the filter ON may hide the current (labeled) image, so don't force
+    // it; turning it OFF tries to land back on the same image.
+    await reloadPreservingFocus(hideLabeledMode ? null : focusedName);
     try { localStorage.setItem('labelman-hide-labeled', hideLabeledMode ? '1' : '0'); } catch(e) {}
   }
   $hideLabeledBtn.addEventListener('click', toggleHideLabeled);
@@ -2394,10 +2464,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
         // Reload current image (cache bust)
         const img = $preview.querySelector('img');
         if (img) img.src = img.src.split('?')[0] + '?t=' + Date.now();
-        await loadImages();
+        await reloadPreservingFocus(name);
       } else {
         $saveStatus.textContent = `Copied to ${data.name}`;
-        await loadImages();
+        await reloadPreservingFocus(name);
       }
     } catch (err) {
       $saveStatus.textContent = 'Crop failed';
