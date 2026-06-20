@@ -13,6 +13,7 @@ from datetime import date
 from pathlib import Path
 
 from .label import MB_FORMAT, TXT_FORMAT, SidecarFormat
+from .schema import TermList
 
 
 _HEADER_TEMPLATE = """\
@@ -121,6 +122,60 @@ def render_terms(counts: Counter[str]) -> str:
         for label, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
     return "".join(f"{line}\n" for line in lines)
+
+
+_UNCATEGORIZED = "Uncategorized"
+
+
+def render_terms_markdown(counts: Counter[str], term_list: TermList | None = None) -> str:
+    """Render the corpus labels as a category-organized Markdown document.
+
+    Each category becomes a ``## <name>`` section whose terms are ``- <term>``
+    bullets (no counts), terms sorted alphabetically. Terms are bucketed via
+    ``TermList.assign_term_to_category``; any label that resolves to no
+    category — or every label when ``term_list`` is None — lands under a final
+    ``## Uncategorized`` section. Categories appear in config order and an
+    empty category is omitted, so the file only lists what the corpus actually
+    uses. Returns a trailing-newline-terminated string (empty when there are
+    no labels).
+    """
+    if not counts:
+        return ""
+
+    labels = sorted(counts)
+    buckets: dict[str, list[str]] = {}
+    order: list[str] = []
+    uncategorized: list[str] = []
+
+    if term_list is not None:
+        for cat in term_list.categories:
+            # First occurrence wins the slot; later duplicate names append to it.
+            if cat.name not in buckets:
+                buckets[cat.name] = []
+                order.append(cat.name)
+        for label in labels:
+            cat = term_list.assign_term_to_category(label)
+            if cat is None:
+                uncategorized.append(label)
+            else:
+                buckets[cat.name].append(label)
+    else:
+        uncategorized = labels
+
+    lines: list[str] = []
+    for name in order:
+        terms = buckets[name]
+        if not terms:
+            continue
+        lines.append(f"## {name}")
+        lines.extend(f"- {t}" for t in terms)
+        lines.append("")
+    if uncategorized:
+        lines.append(f"## {_UNCATEGORIZED}")
+        lines.extend(f"- {t}" for t in uncategorized)
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def render_yaml(terms: list[str]) -> str:

@@ -564,7 +564,7 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 
 def cmd_terms(args: argparse.Namespace) -> int:
-    from .build import count_terms, render_terms
+    from .build import count_terms, render_terms, render_terms_markdown
 
     images_path = Path(args.images)
     if not images_path.is_dir():
@@ -572,16 +572,33 @@ def cmd_terms(args: argparse.Namespace) -> int:
         return 1
 
     output_path = Path(args.output) if args.output else images_path / "terms.txt"
+    # The Markdown sibling sits next to the .txt output, named terms.md by
+    # default (e.g. a `--output freq.txt` yields freq.md alongside it).
+    markdown_path = output_path.with_suffix(".md")
 
     # Exclude the output file from the scan so a re-run never ingests its own
     # previous output (terms.txt is also excluded by reserved-name regardless).
+    # The .md sibling carries an .md suffix, so the sidecar scanner skips it too.
     counts, files_scanned = count_terms(images_path, exclude=output_path)
+
+    # The corpus scan is flat — categories live in labelman.yaml. Load it (when
+    # present) purely to group terms.md by category; a missing or invalid config
+    # is not fatal here, the terms then fall under "Uncategorized".
+    term_list = None
+    config_path = Path(args.config)
+    if config_path.is_file():
+        try:
+            term_list = parse(config_path)
+        except LabelmanError as e:
+            print(f"Warning: could not parse {config_path}; terms.md will be "
+                  f"uncategorized ({e})", file=sys.stderr)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(render_terms(counts))
+    markdown_path.write_text(render_terms_markdown(counts, term_list))
 
-    print(f"Wrote {output_path}: {len(counts)} unique label(s) from "
-          f"{files_scanned} sidecar file(s)")
+    print(f"Wrote {output_path} and {markdown_path}: {len(counts)} unique "
+          f"label(s) from {files_scanned} sidecar file(s)")
     return 0
 
 
@@ -729,7 +746,11 @@ def build_parser() -> argparse.ArgumentParser:
     terms_p = sub.add_parser("terms", help="List labels used across the corpus, frequency-sorted")
     terms_p.add_argument("--images", default=".", help="Directory containing images and sidecars")
     terms_p.add_argument("--output", default=None,
-                         help="Output file (default: terms.txt in the images directory)")
+                         help="Output file (default: terms.txt in the images directory); "
+                              "a category-organized terms.md is written alongside it")
+    terms_p.add_argument("--config", default=DEFAULT_CONFIG,
+                         help="Path to labelman.yaml, used to group terms.md by category "
+                              "(optional; terms without a category go under 'Uncategorized')")
 
     # rename
     rename_p = sub.add_parser("rename", help="Rename a term across config and sidecar files")

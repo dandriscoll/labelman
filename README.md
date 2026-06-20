@@ -143,6 +143,19 @@ Scan the final-label sidecars (`.txt`/`.mb`, excluding intermediate `.labels.*`/
 
 Output defaults to `terms.txt` in the images directory; use `--output` to write elsewhere. The output file is overwritten each run, and `terms.txt` (plus any `--output` file inside the scanned directory) is excluded from the scan, so re-running is idempotent.
 
+Alongside `terms.txt`, a category-organized `terms.md` is written (e.g. `--output freq.txt` produces `freq.md` beside it). It lists the same labels — without counts — grouped under `## <category>` headings:
+
+```markdown
+## lighting
+- natural
+- studio
+
+## mood
+- calm
+```
+
+Categories come from `labelman.yaml` (pass `--config` to point elsewhere; defaults to `labelman.yaml` in the working directory). Terms are bucketed with the same category-resolution the labeler uses, so open-pattern categories (e.g. a `color-` prefix) capture their members too. Labels that match no category — or every label when no config is found — fall under a final `## Uncategorized` section, and categories with no observed terms are omitted.
+
 ### `labelman ui [--images DIR] [--host HOST] [--port PORT]`
 
 Launch a web interface for browsing images and editing manual labels. Supports keyboard navigation, bulk operations, and taxonomy-aware term buttons. Default port: 7933.
@@ -201,7 +214,7 @@ labelman is a bulk image labeling CLI tool (Python 3.10+, PyYAML). The canonical
 - `labelman label --images DIR` -- score images with CLIP, write .detected.txt sidecars
 - `labelman apply --images DIR` -- merge manual + detected into final .txt sidecars
 - `labelman rename --old TERM --new TERM [--dry-run]` -- rename a term across config and all sidecars
-- `labelman terms --images DIR [--output FILE]` -- frequency-sorted list of labels used across the corpus (default: terms.txt)
+- `labelman terms --images DIR [--output FILE] [--config FILE]` -- frequency-sorted list of labels used across the corpus (default: terms.txt), plus a category-organized terms.md
 - `labelman ui --images DIR` -- web UI for manual labeling (port 7933)
 
 ### File layout

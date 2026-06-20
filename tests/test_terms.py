@@ -2,8 +2,9 @@
 
 from pathlib import Path
 
-from labelman.build import count_terms, render_terms
+from labelman.build import count_terms, render_terms, render_terms_markdown
 from labelman.cli import main as cli_main
+from labelman.schema import parse
 
 
 def _img(tmp_path: Path, name: str) -> Path:
@@ -61,6 +62,80 @@ def test_render_terms_empty():
     assert render_terms(Counter()) == ""
 
 
+# --- Markdown rendering ---
+
+_CONFIG = """\
+defaults:
+  threshold: 0.3
+categories:
+  - name: lighting
+    mode: zero-or-one
+    terms:
+      - term: natural
+      - term: studio
+  - name: mood
+    mode: zero-or-more
+    terms:
+      - term: calm
+"""
+
+
+def test_render_terms_markdown_no_config():
+    from collections import Counter
+    counts = Counter({"outdoor": 3, "calm": 1, "single": 2})
+    # Without a term list everything falls under Uncategorized, alphabetized.
+    assert render_terms_markdown(counts) == (
+        "## Uncategorized\n- calm\n- outdoor\n- single\n"
+    )
+
+
+def test_render_terms_markdown_empty():
+    from collections import Counter
+    assert render_terms_markdown(Counter()) == ""
+    assert render_terms_markdown(Counter(), parse(_CONFIG)) == ""
+
+
+def test_render_terms_markdown_grouped_by_category():
+    from collections import Counter
+    term_list = parse(_CONFIG)
+    counts = Counter({"natural": 5, "studio": 2, "calm": 1, "outdoor": 9})
+    out = render_terms_markdown(counts, term_list)
+    # Categories in config order, terms alphabetized within, unknowns last.
+    assert out == (
+        "## lighting\n- natural\n- studio\n\n"
+        "## mood\n- calm\n\n"
+        "## Uncategorized\n- outdoor\n"
+    )
+
+
+def test_render_terms_markdown_omits_empty_categories():
+    from collections import Counter
+    term_list = parse(_CONFIG)
+    # No 'mood' terms in the corpus, so that section is dropped entirely.
+    counts = Counter({"natural": 1})
+    assert render_terms_markdown(counts, term_list) == "## lighting\n- natural\n"
+
+
+def test_render_terms_markdown_open_category():
+    from collections import Counter
+    config = """\
+defaults:
+  threshold: 0.3
+categories:
+  - name: color
+    mode: zero-or-more
+    open: true
+    term_prefix: "color-"
+    terms: []
+"""
+    term_list = parse(config)
+    counts = Counter({"color-red": 2, "color-teal": 1, "plain": 1})
+    assert render_terms_markdown(counts, term_list) == (
+        "## color\n- color-red\n- color-teal\n\n"
+        "## Uncategorized\n- plain\n"
+    )
+
+
 # --- CLI integration ---
 
 def test_cli_terms_default_output(tmp_path, capsys):
@@ -76,6 +151,46 @@ def test_cli_terms_default_output(tmp_path, capsys):
     summary = capsys.readouterr().out
     assert "2 unique label(s)" in summary
     assert "2 sidecar file(s)" in summary
+
+
+def test_cli_terms_writes_markdown_sibling(tmp_path):
+    _img(tmp_path, "a.jpg")
+    _img(tmp_path, "b.jpg")
+    (tmp_path / "a.txt").write_text("natural, calm")
+    (tmp_path / "b.txt").write_text("studio")
+    (tmp_path / "labelman.yaml").write_text(_CONFIG)
+    rc = cli_main(["terms", "--images", str(tmp_path),
+                   "--config", str(tmp_path / "labelman.yaml")])
+    assert rc == 0
+    md = tmp_path / "terms.md"
+    assert md.is_file()
+    assert md.read_text() == (
+        "## lighting\n- natural\n- studio\n\n"
+        "## mood\n- calm\n"
+    )
+
+
+def test_cli_terms_markdown_without_config(tmp_path):
+    _img(tmp_path, "a.jpg")
+    (tmp_path / "a.txt").write_text("outdoor, calm")
+    # Point --config at a path that does not exist: terms.md is still written,
+    # everything under Uncategorized.
+    rc = cli_main(["terms", "--images", str(tmp_path),
+                   "--config", str(tmp_path / "missing.yaml")])
+    assert rc == 0
+    assert (tmp_path / "terms.md").read_text() == (
+        "## Uncategorized\n- calm\n- outdoor\n"
+    )
+
+
+def test_cli_terms_markdown_path_follows_output(tmp_path):
+    _img(tmp_path, "a.jpg")
+    (tmp_path / "a.txt").write_text("outdoor")
+    dest = tmp_path / "sub" / "freq.txt"
+    rc = cli_main(["terms", "--images", str(tmp_path), "--output", str(dest)])
+    assert rc == 0
+    # The .md sibling tracks the --output base name.
+    assert (tmp_path / "sub" / "freq.md").read_text() == "## Uncategorized\n- outdoor\n"
 
 
 def test_cli_terms_explicit_output(tmp_path):
