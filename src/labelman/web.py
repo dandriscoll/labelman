@@ -2534,14 +2534,18 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
     const img = $preview.querySelector('img');
     if (!img) return;
     e.preventDefault();
-    const rect = $preview.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
     const oldZoom = zoomLevel;
     const delta = e.deltaY > 0 ? 0.9 : 1.1;
     zoomLevel = Math.max(0.5, Math.min(20, zoomLevel * delta));
-    panX = mx - (mx - panX) * (zoomLevel / oldZoom);
-    panY = my - (my - panY) * (zoomLevel / oldZoom);
+    const ratio = zoomLevel / oldZoom;
+    // Zoom toward the cursor (#5): keep the image point under the cursor fixed.
+    // imgRect already includes the flex-centering offset and the current
+    // transform, so measuring the cursor relative to the image's top-left gives
+    // the correct anchor (the old code measured from the preview origin, which
+    // omits the centering offset and pulls the anchor toward the image center).
+    const imgRect = img.getBoundingClientRect();
+    panX += (e.clientX - imgRect.left) * (1 - ratio);
+    panY += (e.clientY - imgRect.top) * (1 - ratio);
     applyZoom();
   }, {passive: false});
 
